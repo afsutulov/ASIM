@@ -8,7 +8,6 @@ Group=contractor
 WorkingDirectory=/opt/asim
 Environment="LD_LIBRARY_PATH=/opt/onnxruntime/lib:/opt/cudnn/lib"
 Environment=ASIM_CONFIG=/opt/asim/data/config.json
-Environment=ASIM_SECRET_KEY=change-this-secret
 ExecStart=/opt/asim/task --run
 Restart=always
 RestartSec=3

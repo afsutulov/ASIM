@@ -142,38 +142,49 @@ function openModal(content, large = false) {
 function closeModal() { const backdrop = document.getElementById('modal-backdrop'); backdrop.classList.add('hidden'); backdrop.innerHTML = ''; }
 
 function processingModalTemplate() {
-  const modelOptions = boot.modelOptions.map((item) => `<option value="${item.key}" data-inputs="${item.inputs}" data-season="${item.season || ''}">${item.description}</option>`).join('');
+  const preprocessOptions = boot.preprocessOptions.map((item) => `<option value="${item.key}">${item.name}</option>`).join('');
   const poligonOptions = boot.poligonOptions.map((item) => `<option value="${item.key}">${item.name}</option>`).join('');
   return `
     <div class="section-header"><h3>Создать обработку</h3><button class="ghost-btn" data-close-modal>✕</button></div>
     <form id="create-processing-form" class="form-grid">
-      <label>Модель<select id="model" name="model" required><option value="">Выберите модель</option>${modelOptions}</select></label>
-      <label>Локация<select id="poligon" name="poligon" required><option value="">Выберите локацию</option>${poligonOptions}</select></label>
-      <label id="start-label">Дата начала<input type="date" id="start" name="start" required></label>
-      <label id="end-label">Дата завершения<input type="date" id="end" name="end" required></label>
+      <label>Источник обработки<select id="preprocess" name="preprocess" required><option value="">Выберите источник</option>${preprocessOptions}</select></label>
+      <label id="model-label" class="hidden">Модель<select id="model" name="model"><option value="">Выберите модель</option></select></label>
+      <label id="poligon-label" class="hidden">Локация<select id="poligon" name="poligon"><option value="">Выберите локацию</option>${poligonOptions}</select></label>
+      <label id="start-label" class="hidden">Дата начала<input type="date" id="start" name="start"></label>
+      <label id="end-label" class="hidden">Дата завершения<input type="date" id="end" name="end"></label>
       <div id="second-inputs" class="hidden full form-grid">
         <label>Дата начала (start2)<input type="date" id="start2" name="start2"></label>
         <label>Дата завершения (end2)<input type="date" id="end2" name="end2"></label>
       </div>
       <div id="season-year-inputs" class="hidden full form-grid">
         <label>Год нового снимка<select id="year" name="year"><option value="">Выберите год</option></select></label>
-        <label>Год базового снимка<select id="year2" name="year2"><option value="">Выберите год</option></select></label>
+        <label id="year2-wrap">Год базового снимка<select id="year2" name="year2"><option value="">Выберите год</option></select></label>
         <div id="season-hint" class="muted full"></div>
       </div>
-      <label class="full">Облачность: <span id="cloud-value">50</span>%<input type="range" id="cloud" name="cloud" min="0" max="100" value="50"></label>
+      <div id="ortho-year-inputs" class="hidden full form-grid">
+        <label>Год начала поиска<select id="ortho-start" name="ortho-start"><option value="">Выберите год</option></select></label>
+        <label>Год завершения поиска<select id="ortho-end" name="ortho-end"><option value="">Выберите год</option></select></label>
+      </div>
+      <label id="cloud-wrap" class="full hidden">Облачность: <span id="cloud-value">50</span>%<input type="range" id="cloud" name="cloud" min="0" max="100" value="50"></label>
       <div class="full"><button class="primary-btn" type="submit">Создать</button></div>
       <div id="create-error" class="alert hidden full"></div>
     </form>`;
 }
 
 function bindProcessingModal() {
+  const preprocessSelect = document.getElementById('preprocess');
+  const modelLabel = document.getElementById('model-label');
   const modelSelect = document.getElementById('model');
+  const poligonLabel = document.getElementById('poligon-label');
   const secondInputs = document.getElementById('second-inputs');
   const seasonYearInputs = document.getElementById('season-year-inputs');
+  const orthoYearInputs = document.getElementById('ortho-year-inputs');
   const startLabel = document.getElementById('start-label');
   const endLabel = document.getElementById('end-label');
   const startEl = document.getElementById('start');
   const endEl = document.getElementById('end');
+  const cloudWrap = document.getElementById('cloud-wrap');
+  const year2Wrap = document.getElementById('year2-wrap');
 
   const SEASON_RANGES = {
     spring: (y) => [`${y}-03-01`, `${y}-05-31`],
@@ -183,20 +194,58 @@ function bindProcessingModal() {
   };
   const SEASON_LABELS = { spring: 'весна', summer: 'лето', autumn: 'осень', winter: 'зима' };
 
-  let cachedYears = [];
+  const yearsCache = { sentinel: [], ortophoto: [] };
 
-  async function loadYears() {
-    if (cachedYears.length) return;
-    try { cachedYears = await fetchJson('/api/available-years'); } catch (_) { cachedYears = []; }
+  async function loadYears(source) {
+    if (yearsCache[source]?.length) return yearsCache[source];
+    try {
+      yearsCache[source] = await fetchJson(`/api/available-years?source=${encodeURIComponent(source)}`);
+    } catch (_) {
+      yearsCache[source] = [];
+    }
+    return yearsCache[source];
   }
 
-  function fillYearSelects() {
-    ['year', 'year2'].forEach((id) => {
-      const sel = document.getElementById(id);
-      const prev = sel.value;
-      sel.innerHTML = '<option value="">Выберите год</option>' +
-        cachedYears.map((y) => `<option value="${y}"${String(y) === prev ? ' selected' : ''}>${y}</option>`).join('');
-    });
+  function fillSelect(selectId, years) {
+    const sel = document.getElementById(selectId);
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">Выберите год</option>' +
+      years.map((y) => `<option value="${y}"${String(y) === prev ? ' selected' : ''}>${y}</option>`).join('');
+  }
+
+  function filteredModels(preprocessKey) {
+    const preprocess = boot.preprocessOptions.find((item) => item.key === preprocessKey);
+    const allowed = new Set((preprocess?.list || []).map((v) => String(v).toLowerCase()));
+    return boot.modelOptions.filter((item) => allowed.has(String(item.preprocess || '').toLowerCase()));
+  }
+
+  function populateModels(preprocessKey) {
+    const items = filteredModels(preprocessKey);
+    modelSelect.innerHTML = '<option value="">Выберите модель</option>' +
+      items.map((item) => `<option value="${item.key}" data-inputs="${item.inputs}" data-season="${item.season || ''}" data-preprocess="${item.preprocess || ''}">${item.description}</option>`).join('');
+  }
+
+  function resetFields() {
+    modelLabel.classList.add('hidden');
+    poligonLabel.classList.add('hidden');
+    startLabel.classList.add('hidden');
+    endLabel.classList.add('hidden');
+    secondInputs.classList.add('hidden');
+    seasonYearInputs.classList.add('hidden');
+    orthoYearInputs.classList.add('hidden');
+    cloudWrap.classList.add('hidden');
+    year2Wrap.classList.remove('hidden');
+
+    startEl.required = false;
+    endEl.required = false;
+    document.getElementById('start2').required = false;
+    document.getElementById('end2').required = false;
+    document.getElementById('year').required = false;
+    document.getElementById('year2').required = false;
+    document.getElementById('ortho-start').required = false;
+    document.getElementById('ortho-end').required = false;
+    modelSelect.required = false;
+    document.getElementById('poligon').required = false;
   }
 
   function updateSeasonHint(season) {
@@ -204,6 +253,7 @@ function bindProcessingModal() {
     const y = Number(document.getElementById('year').value);
     const y2 = Number(document.getElementById('year2').value);
     const label = SEASON_LABELS[season] || season;
+    hint.classList.remove('hidden');
     if (y && y2 && SEASON_RANGES[season]) {
       const [s1, e1] = SEASON_RANGES[season](y);
       const [s2, e2] = SEASON_RANGES[season](y2);
@@ -213,56 +263,86 @@ function bindProcessingModal() {
     }
   }
 
-  modelSelect.addEventListener('change', async () => {
-    const sel = modelSelect.options[modelSelect.selectedIndex];
-    const inputs = Number(sel.dataset.inputs || '1');
-    const season = sel.dataset.season || '';
-
-    // Сбросить всё в исходное состояние
+  async function applyModelMode() {
     secondInputs.classList.add('hidden');
     seasonYearInputs.classList.add('hidden');
-    startLabel.classList.remove('hidden');
-    endLabel.classList.remove('hidden');
-    startEl.required = true;
-    endEl.required = true;
+    orthoYearInputs.classList.add('hidden');
+    startLabel.classList.add('hidden');
+    endLabel.classList.add('hidden');
+    cloudWrap.classList.add('hidden');
+    startEl.required = false;
+    endEl.required = false;
     document.getElementById('start2').required = false;
     document.getElementById('end2').required = false;
     document.getElementById('year').required = false;
     document.getElementById('year2').required = false;
+    document.getElementById('ortho-start').required = false;
+    document.getElementById('ortho-end').required = false;
+
+    const preprocessKey = preprocessSelect.value;
+    const sel = modelSelect.options[modelSelect.selectedIndex];
+    const inputs = Number(sel?.dataset.inputs || '1');
+    const season = sel?.dataset.season || '';
+
+    if (!preprocessKey || !modelSelect.value) return;
+
+    poligonLabel.classList.remove('hidden');
+    document.getElementById('poligon').required = true;
+
+    if (preprocessKey === 'ortophoto') {
+      const years = await loadYears('ortophoto');
+      fillSelect('ortho-start', years);
+      fillSelect('ortho-end', years);
+      orthoYearInputs.classList.remove('hidden');
+      document.getElementById('ortho-start').required = true;
+      document.getElementById('ortho-end').required = true;
+      return;
+    }
+
+    cloudWrap.classList.remove('hidden');
 
     if (season) {
-      // Сезонная модель: скрываем ввод дат, показываем выбор года.
-      // Работает независимо от inputs — год выбирается всегда когда задан season.
-      startLabel.classList.add('hidden');
-      endLabel.classList.add('hidden');
-      startEl.required = false;
-      endEl.required = false;
-      await loadYears();
-      fillYearSelects();
+      const years = await loadYears('sentinel');
+      fillSelect('year', years);
+      fillSelect('year2', years);
       seasonYearInputs.classList.remove('hidden');
       document.getElementById('year').required = true;
-      // year2 нужен только при inputs=2 (базовый период)
-      const year2Label = document.querySelector('label[for="year2"], #season-year-inputs label:nth-child(2)');
       if (inputs === 2) {
+        year2Wrap.classList.remove('hidden');
         document.getElementById('year2').required = true;
-        if (year2Label) year2Label.classList.remove('hidden');
-        updateSeasonHint(season);
-        ['year', 'year2'].forEach((id) =>
-          document.getElementById(id).addEventListener('change', () => updateSeasonHint(season)));
       } else {
-        document.getElementById('year2').required = false;
-        if (year2Label) year2Label.classList.add('hidden');
-        const hint = document.getElementById('season-hint');
-        if (hint) hint.classList.add('hidden');
-        document.getElementById('year').addEventListener('change', () => updateSeasonHint(season));
+        year2Wrap.classList.add('hidden');
       }
-    } else if (inputs === 2) {
-      // Не сезонная, но двухпериодная: ручной ввод второго диапазона дат
+      updateSeasonHint(season);
+      return;
+    }
+
+    startLabel.classList.remove('hidden');
+    endLabel.classList.remove('hidden');
+    startEl.required = true;
+    endEl.required = true;
+    if (inputs === 2) {
       secondInputs.classList.remove('hidden');
       document.getElementById('start2').required = true;
       document.getElementById('end2').required = true;
     }
+  }
+
+  preprocessSelect.addEventListener('change', async () => {
+    resetFields();
+    const preprocessKey = preprocessSelect.value;
+    if (!preprocessKey) {
+      modelSelect.innerHTML = '<option value="">Выберите модель</option>';
+      return;
+    }
+    modelLabel.classList.remove('hidden');
+    modelSelect.required = true;
+    populateModels(preprocessKey);
   });
+
+  modelSelect.addEventListener('change', applyModelMode);
+  document.getElementById('year').addEventListener('change', () => updateSeasonHint(modelSelect.options[modelSelect.selectedIndex]?.dataset.season || ''));
+  document.getElementById('year2').addEventListener('change', () => updateSeasonHint(modelSelect.options[modelSelect.selectedIndex]?.dataset.season || ''));
 
   const cloud = document.getElementById('cloud');
   cloud.addEventListener('input', () => document.getElementById('cloud-value').textContent = cloud.value);
@@ -271,33 +351,44 @@ function bindProcessingModal() {
     event.preventDefault();
     const errorBox = document.getElementById('create-error');
     errorBox.classList.add('hidden');
+
+    const preprocessKey = preprocessSelect.value;
     const sel = modelSelect.options[modelSelect.selectedIndex];
-    const season = sel.dataset.season || '';
-    const inputs = Number(sel.dataset.inputs || '1');
+    const season = sel?.dataset.season || '';
+    const inputs = Number(sel?.dataset.inputs || '1');
+
     const payload = {
-      model: document.getElementById('model').value,
+      preprocess: preprocessKey,
+      model: modelSelect.value,
       poligon: document.getElementById('poligon').value,
-      cloud: Number(document.getElementById('cloud').value),
     };
-    if (season) {
-      // Сезонная модель: передаём год(ы), бэкенд сам вычислит даты
-      payload.year = Number(document.getElementById('year').value);
-      if (inputs === 2) {
-        payload.year2 = Number(document.getElementById('year2').value);
-      }
+
+    if (preprocessKey === 'ortophoto') {
+      payload.start = Number(document.getElementById('ortho-start').value);
+      payload.end = Number(document.getElementById('ortho-end').value);
     } else {
-      payload.start = document.getElementById('start').value;
-      payload.end = document.getElementById('end').value;
-      if (inputs === 2) {
-        payload.start2 = document.getElementById('start2').value;
-        payload.end2 = document.getElementById('end2').value;
+      payload.cloud = Number(document.getElementById('cloud').value);
+      if (season) {
+        payload.year = Number(document.getElementById('year').value);
+        if (inputs === 2) payload.year2 = Number(document.getElementById('year2').value);
+      } else {
+        payload.start = document.getElementById('start').value;
+        payload.end = document.getElementById('end').value;
+        if (inputs === 2) {
+          payload.start2 = document.getElementById('start2').value;
+          payload.end2 = document.getElementById('end2').value;
+        }
       }
     }
+
     try {
       await fetchJson('/api/processing/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
       closeModal();
       await loadProcessing();
-    } catch (error) { errorBox.textContent = error.message; errorBox.classList.remove('hidden'); }
+    } catch (error) {
+      errorBox.textContent = error.message;
+      errorBox.classList.remove('hidden');
+    }
   });
 }
 

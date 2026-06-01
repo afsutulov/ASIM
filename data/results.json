@@ -1,4 +1,12 @@
 {
+  "1f5baa93-5684-40a0-a75b-7ce9222e5131": {
+    "model": "water",
+    "poligon": "kray",
+    "cloud": 50,
+    "start": "2025-07-01",
+    "end": "2025-07-31",
+    "time": "2026-04-09 10:20"
+  },
   "274c841e-a9f0-401b-a548-7c48e829579c": {
     "model": "arable",
     "poligon": "kray",
@@ -7,21 +15,21 @@
     "end": "2025-08-31",
     "time": "2026-03-24 11:12"
   },
-  "37b5e39c-1bd3-44c4-a2bc-106f0f8cf2ae": {
-    "model": "fire",
-    "poligon": "dca0ec0798a641779997303b22b0a65c",
-    "cloud": 100,
-    "start": "2024-06-01",
-    "end": "2024-08-31",
-    "time": "2026-04-01 19:03"
-  },
-  "3b349397-3cbe-4395-bbe6-494dc9ca8b4e": {
-    "model": "water",
+  "2f8a7d84-94c2-4bae-b2be-08d7ff3aaf68": {
+    "model": "forest_disease",
     "poligon": "kray",
     "cloud": 50,
     "start": "2025-06-01",
-    "end": "2025-06-15",
-    "time": "2026-04-08 11:55"
+    "end": "2025-08-31",
+    "time": "2026-04-21 14:36"
+  },
+  "37b5e39c-1bd3-44c4-a2bc-106f0f8cf2ae": {
+    "model": "fire",
+    "poligon": "kray",
+    "cloud": 50,
+    "start": "2025-07-01",
+    "end": "2025-07-31",
+    "time": "2026-04-01 19:03"
   },
   "562f72f9-c1dc-43f4-8cf1-1216b5265267": {
     "model": "reforestation",
@@ -31,56 +39,28 @@
     "end": "2025-08-31",
     "time": "2026-04-01 11:43"
   },
-  "6fc3582f-c0ec-4be9-b5da-4def218d7c4c": {
+  "7bbd9732-fdc8-4792-9038-38190f051dbc": {
+    "model": "hogweed",
+    "poligon": "perm",
+    "cloud": 50,
+    "start": "2025-07-15",
+    "end": "2025-08-15",
+    "time": "2026-04-21 09:17"
+  },
+  "7fd8accd-e057-4829-8a2c-e5ef91b99b7c": {
     "model": "hogweed",
     "poligon": "kray",
     "cloud": 50,
     "start": "2025-07-15",
     "end": "2025-08-15",
-    "time": "2026-03-23 06:25"
+    "time": "2026-04-22 03:22"
   },
-  "793c3ff7-9d98-405d-b2fb-3bfe307f52d3": {
-    "model": "quarry",
-    "poligon": "dca0ec0798a641779997303b22b0a65c",
-    "cloud": 100,
-    "start": "2024-06-01",
-    "end": "2024-08-31",
-    "time": "2026-03-28 04:22"
-  },
-  "8df85d8c-be10-4d74-a85d-fde8bd5ce6f6": {
-    "model": "def_sum",
-    "poligon": "dca0ec0798a641779997303b22b0a65c",
-    "cloud": 100,
-    "start": "2024-06-01",
-    "end": "2024-08-31",
-    "time": "2026-03-28 03:20",
-    "start2": "2023-06-01",
-    "end2": "2023-08-31"
-  },
-  "bb39e4bf-056e-44c3-934a-e75cfd4710c1": {
-    "model": "forest_disease",
+  "dc96357d-1629-418a-b00b-75e6a2751988": {
+    "model": "arable",
     "poligon": "kray",
-    "cloud": 30,
+    "cloud": 50,
     "start": "2025-06-01",
     "end": "2025-08-31",
-    "time": "2026-03-29 23:03"
-  },
-  "c4097dbc-42c7-4e89-a5c1-1313f91bcc9a": {
-    "model": "windfall",
-    "poligon": "dca0ec0798a641779997303b22b0a65c",
-    "cloud": 100,
-    "start": "2024-06-01",
-    "end": "2024-08-31",
-    "time": "2026-03-29 03:28",
-    "start2": "2023-06-01",
-    "end2": "2023-08-31"
-  },
-  "ee4bd8f5-cd5b-4a34-b9e8-5dcde7015473": {
-    "model": "landfill",
-    "poligon": "dca0ec0798a641779997303b22b0a65c",
-    "cloud": 100,
-    "start": "2024-06-01",
-    "end": "2024-08-31",
-    "time": "2026-03-29 22:19"
+    "time": "2026-04-23 05:04"
   }
 }

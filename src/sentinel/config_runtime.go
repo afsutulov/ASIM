@@ -10,6 +10,7 @@ import (
 
 type AppConfig struct {
 	ModelsPath   string
+	Compute      RuntimeDeviceConfig
 	Logs         string
 	Satellite    string
 	Sentinel     string
@@ -31,18 +32,19 @@ type PolygonSpec struct {
 }
 
 type rawPaths struct {
-	Logs         string `json:"logs"`
-	Satellite    string `json:"satellite"`
-	Sentinel     string `json:"sentinel"`
-	Sentinel2A   string `json:"sentinel2A"`
-	Tmp          string `json:"tmp"`
-	Users        string `json:"users"`
-	PoliPath     string `json:"poli_path"`
-	PoligonsFile string `json:"poligons"`
-	ResultsPath  string `json:"results_path"`
-	ResultsFile  string `json:"results"`
-	Prosessing   string `json:"prosessing"`
-	ModelsPath   string `json:"models_path"`
+	Compute      ComputeConfig `json:"compute"`
+	Logs         string        `json:"logs"`
+	Satellite    string        `json:"satellite"`
+	Sentinel     string        `json:"sentinel"`
+	Sentinel2A   string        `json:"sentinel2A"`
+	Tmp          string        `json:"tmp"`
+	Users        string        `json:"users"`
+	PoliPath     string        `json:"poli_path"`
+	PoligonsFile string        `json:"poligons"`
+	ResultsPath  string        `json:"results_path"`
+	ResultsFile  string        `json:"results"`
+	Prosessing   string        `json:"prosessing"`
+	ModelsPath   string        `json:"models_path"`
 }
 
 func DefaultConfigPath() string {
@@ -69,6 +71,7 @@ func LoadAppConfig(path string) (*AppConfig, error) {
 		}
 	}
 	cfg := &AppConfig{
+		Compute:      resolveRuntimeDevice(rp.Compute, "", nil, "", 0),
 		ModelsPath:   rp.ModelsPath,
 		Logs:         rp.Logs,
 		Satellite:    rp.Satellite,
@@ -130,12 +133,12 @@ func (cfg *AppConfig) PolygonPath(name string) (string, error) {
 	if strings.TrimSpace(cfg.PoliPath) == "" {
 		return "", fmt.Errorf("poli_path is empty")
 	}
-	return filepath.Join(cfg.PoliPath, name+".geojson"), nil
+	return filepath.Join(cfg.PoliPath, safeName(name)+".geojson"), nil
 }
 
 func (cfg *AppConfig) ModelPath(spec ModelSpec) string {
 	if filepath.IsAbs(spec.ONNXFile) || strings.TrimSpace(cfg.ModelsPath) == "" {
 		return spec.ONNXFile
 	}
-	return filepath.Join(cfg.ModelsPath, spec.ONNXFile)
+	return filepath.Join(cfg.ModelsPath, safeName(spec.ONNXFile))
 }

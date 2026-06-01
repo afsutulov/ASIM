@@ -7,16 +7,49 @@
       <img src="{{ url_for('static', filename='gerb.png') }}" alt="Герб" class="login-logo">
       <h1>Аналитическая Система Интеллектуального Мониторинга</h1>
     </div>
-    <form method="post" class="login-form">
+    <form id="login-form" class="login-form">
       <label>Имя пользователя
-        <input type="text" name="username" required autocomplete="username">
+        <input type="text" name="username" id="login-username" required autocomplete="username">
       </label>
       <label>Пароль
-        <input type="password" name="password" required autocomplete="current-password">
+        <input type="password" name="password" id="login-password" required autocomplete="current-password">
       </label>
-      {% if error %}<div class="alert">{{ error }}</div>{% endif %}
-      <button type="submit" class="primary-btn">Войти</button>
+      {% if error %}<div class="alert" id="login-error">{{ error }}</div>{% endif %}
+      <div class="alert hidden" id="login-error-js"></div>
+      <button type="submit" class="primary-btn" id="login-btn">Войти</button>
     </form>
   </div>
 </div>
+<script>
+  document.getElementById('login-form').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    var btn = document.getElementById('login-btn');
+    var errBox = document.getElementById('login-error-js');
+    btn.disabled = true;
+    errBox.classList.add('hidden');
+    errBox.textContent = '';
+    try {
+      var resp = await fetch('/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: document.getElementById('login-username').value,
+          password: document.getElementById('login-password').value
+        })
+      });
+      var data = await resp.json();
+      if (data.ok && data.next) {
+        window.location.href = data.next;
+      } else {
+        errBox.textContent = data.error || 'Ошибка входа';
+        errBox.classList.remove('hidden');
+        btn.disabled = false;
+      }
+    } catch (err) {
+      errBox.textContent = 'Ошибка соединения';
+      errBox.classList.remove('hidden');
+      btn.disabled = false;
+    }
+  });
+</script>
 {% endblock %}

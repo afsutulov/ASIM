@@ -21,12 +21,17 @@ const (
 	timeLayout        = "2006-01-02 15:04"
 )
 
+type TaskModelSpec struct {
+	Preprocess string `json:"preprocess"`
+}
+
 type Config struct {
-	Prosessing  string `json:"prosessing"`
-	Results     string `json:"results"`
-	ResultsPath string `json:"results_path"`
-	Path        string `json:"path"`
-	Logs        string `json:"logs"`
+	Prosessing  string                   `json:"prosessing"`
+	Results     string                   `json:"results"`
+	ResultsPath string                   `json:"results_path"`
+	Path        string                   `json:"path"`
+	Logs        string                   `json:"logs"`
+	Models      map[string]TaskModelSpec `json:"models"`
 }
 
 type Record struct {
@@ -71,10 +76,12 @@ func main() {
 	logger.Printf("task started: config=%s prosessing=%s results=%s results_path=%s path=%s logs=%s", *configPath, cfg.Prosessing, cfg.Results, cfg.ResultsPath, cfg.Path, cfg.Logs)
 
 	sentinelPath := filepath.Join(cfg.Path, "sentinel")
+	ortophotoPath := filepath.Join(cfg.Path, "ortophoto")
 	if _, err := os.Stat(sentinelPath); err != nil {
 		logger.Printf("sentinel executable check failed: %v", err)
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	}
+	if _, err := os.Stat(ortophotoPath); err != nil {
+		logger.Printf("ortophoto executable check failed: %v", err)
 	}
 
 	for {
@@ -94,12 +101,11 @@ func main() {
 		logger.Printf("picked process: id=%s model=%s poligon=%s cloud=%s start=%s end=%s start2=%s end2=%s time=%s queue=%d",
 			item.ID, r.Model, r.Poligon, cloudString(r.Cloud), r.Start, r.End, r.Start2, r.End2, r.Time, len(queue))
 
-		exitCode, runErr := runSentinel(logger, sentinelPath, item)
+		exitCode, runErr := runWorker(logger, cfg, *configPath, sentinelPath, ortophotoPath, item)
 
-		// Reload queue before write to avoid losing external updates.
 		queueNow, err := loadMap(cfg.Prosessing)
 		if err != nil {
-			logger.Printf("failed to reload prosessing file after sentinel run: %v", err)
+			logger.Printf("failed to reload prosessing file after worker run: %v", err)
 			time.Sleep(pollInterval)
 			continue
 		}
@@ -111,14 +117,12 @@ func main() {
 				continue
 			}
 			logger.Printf("process removed from prosessing: id=%s remaining=%d", item.ID, len(queueNow))
-		} else {
-			logger.Printf("process already absent in prosessing when removing: id=%s", item.ID)
 		}
 
 		zipPath := filepath.Join(cfg.ResultsPath, item.ID+".zip")
 		if _, err := os.Stat(zipPath); err != nil {
 			if os.IsNotExist(err) {
-				logger.Printf("result annulled: id=%s zip archive not created by sentinel: %s", item.ID, zipPath)
+				logger.Printf("result annulled: id=%s zip archive not created: %s", item.ID, zipPath)
 			} else {
 				logger.Printf("result annulled: id=%s unable to stat zip archive %s: %v", item.ID, zipPath, err)
 			}
@@ -139,19 +143,20 @@ func main() {
 			time.Sleep(pollInterval)
 			continue
 		}
-		logger.Printf("result saved: id=%s model=%s poligon=%s cloud=%s start=%s end=%s start2=%s end2=%s time=%s zip=%s total_results=%d sentinel_exit=%d sentinel_error=%v",
-			item.ID, result.Model, result.Poligon, cloudString(result.Cloud), result.Start, result.End, result.Start2, result.End2, result.Time, zipPath, len(resultsMap), exitCode, runErr)
+		logger.Printf("result saved: id=%s model=%s poligon=%s cloud=%s start=%s end=%s start2=%s end2=%s time=%s zip=%s worker_exit=%d worker_error=%v",
+			item.ID, result.Model, result.Poligon, cloudString(result.Cloud), result.Start, result.End, result.Start2, result.End2, result.Time, zipPath, exitCode, runErr)
 	}
 }
 
 func printGreeting(configPath string) {
 	fmt.Println("Аналитическая Система Интеллектуального Мониторинга")
 	fmt.Println("Модуль запуска задач по очереди процессов")
-	fmt.Println("ГБУ ПК \"Центр информационного развития Пермского края\". 2026 год\n")
+	fmt.Println("ГБУ ПК \"Центр информационного развития Пермского края\". 2026 год")
 	fmt.Println("Запуск сервиса:")
-	fmt.Println("./task --run [--config ./data/config.json]\n")
+	fmt.Println("./task --run [--config ./data/config.json]")
 	fmt.Println("Интервал проверки очереди: 60 секунд")
 }
+
 func loadConfig(path string) (Config, error) {
 	var cfg Config
 	data, err := os.ReadFile(path)
@@ -248,9 +253,20 @@ func oldest(m map[string]Record) (QueueItem, bool) {
 	return items[0], true
 }
 
-func runSentinel(logger *log.Logger, sentinelPath string, item QueueItem) (int, error) {
+func runWorker(logger *log.Logger, cfg Config, configPath, sentinelPath, ortophotoPath string, item QueueItem) (int, error) {
+	spec := cfg.Models[item.Record.Model]
+	switch strings.ToLower(strings.TrimSpace(spec.Preprocess)) {
+	case "ortophoto":
+		return runOrthophoto(logger, configPath, ortophotoPath, item)
+	default:
+		return runSentinel(logger, configPath, sentinelPath, item)
+	}
+}
+
+func runSentinel(logger *log.Logger, configPath, sentinelPath string, item QueueItem) (int, error) {
 	r := item.Record
 	args := []string{
+		"--config", configPath,
 		"--model", r.Model,
 		"--start", r.Start,
 		"--end", r.End,
@@ -263,22 +279,38 @@ func runSentinel(logger *log.Logger, sentinelPath string, item QueueItem) (int, 
 	if strings.TrimSpace(r.Start2) != "" && strings.TrimSpace(r.End2) != "" {
 		args = append(args, "--start2", r.Start2, "--end2", r.End2)
 	}
+	return runCommand(logger, "sentinel", sentinelPath, item.ID, args)
+}
 
-	logger.Printf("starting sentinel: %s %s", sentinelPath, strings.Join(args, " "))
-	cmd := exec.Command(sentinelPath, args...)
+func runOrthophoto(logger *log.Logger, configPath, ortophotoPath string, item QueueItem) (int, error) {
+	r := item.Record
+	args := []string{
+		"--config", configPath,
+		"--model", r.Model,
+		"--poligon", r.Poligon,
+		"--start", r.Start,
+		"--end", r.End,
+		"--out", item.ID,
+	}
+	return runCommand(logger, "ortophoto", ortophotoPath, item.ID, args)
+}
+
+func runCommand(logger *log.Logger, workerName, binPath, itemID string, args []string) (int, error) {
+	logger.Printf("starting %s: %s %s", workerName, binPath, strings.Join(args, " "))
+	cmd := exec.Command(binPath, args...)
 	output, err := cmd.CombinedOutput()
 	outText := strings.TrimSpace(string(output))
 	if outText == "" {
-		logger.Printf("sentinel output for id=%s: <empty>", item.ID)
+		logger.Printf("%s output for id=%s: <empty>", workerName, itemID)
 	} else {
-		logger.Printf("sentinel output for id=%s:\n%s", item.ID, outText)
+		logger.Printf("%s output for id=%s:\n%s", workerName, itemID, outText)
 	}
 	if err != nil {
 		code := exitStatus(err)
-		logger.Printf("sentinel finished with error: id=%s exit_code=%d error=%v", item.ID, code, err)
+		logger.Printf("%s finished with error: id=%s exit_code=%d error=%v", workerName, itemID, code, err)
 		return code, err
 	}
-	logger.Printf("sentinel finished successfully: id=%s exit_code=0", item.ID)
+	logger.Printf("%s finished successfully: id=%s exit_code=0", workerName, itemID)
 	return 0, nil
 }
 
@@ -287,12 +319,7 @@ func parseTime(s string) time.Time {
 	if s == "" {
 		return time.Unix(0, 0)
 	}
-	layouts := []string{
-		timeLayout,
-		"2006-01-02 15:04:05",
-		time.RFC3339,
-		"2006-01-02T15:04",
-	}
+	layouts := []string{timeLayout, "2006-01-02 15:04:05", time.RFC3339, "2006-01-02T15:04"}
 	for _, layout := range layouts {
 		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
 			return t

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -24,6 +25,11 @@ func initORT() error {
 
 type ORTSession struct {
 	sess *ort.DynamicAdvancedSession
+}
+
+type ORTSessionPool struct {
+	sessions []*ORTSession
+	next     uint64
 }
 
 func NewORTSession(modelPath string, device string, cudaDeviceID int) (*ORTSession, error) {
@@ -96,4 +102,47 @@ func (s *ORTSession) Predict(input []float32, batch, channels, height, width, ou
 	cpy := make([]float32, len(out))
 	copy(cpy, out)
 	return cpy, nil
+}
+
+func NewORTSessionPool(modelPath string, device string, gpuDevices []int) (*ORTSessionPool, error) {
+	device = normalizeRuntimeDevice(device)
+	if device == "cpu" {
+		s, err := NewORTSession(modelPath, "cpu", 0)
+		if err != nil {
+			return nil, err
+		}
+		return &ORTSessionPool{sessions: []*ORTSession{s}}, nil
+	}
+	gpuDevices = normalizeGPUList(gpuDevices)
+	pool := &ORTSessionPool{sessions: make([]*ORTSession, 0, len(gpuDevices))}
+	for _, gpuID := range gpuDevices {
+		s, err := NewORTSession(modelPath, "cuda", gpuID)
+		if err != nil {
+			pool.Close()
+			return nil, err
+		}
+		pool.sessions = append(pool.sessions, s)
+	}
+	return pool, nil
+}
+
+func (p *ORTSessionPool) Next() *ORTSession {
+	if p == nil || len(p.sessions) == 0 {
+		return nil
+	}
+	idx := int(atomic.AddUint64(&p.next, 1)-1) % len(p.sessions)
+	return p.sessions[idx]
+}
+
+func (p *ORTSessionPool) Close() error {
+	if p == nil {
+		return nil
+	}
+	var first error
+	for _, s := range p.sessions {
+		if err := s.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }

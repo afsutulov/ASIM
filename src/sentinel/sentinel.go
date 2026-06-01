@@ -154,7 +154,7 @@ func l2aMetadataBandMatches(safeRoot, band string, spec ModelSpec) []string {
 	if safeRoot == "" || band == "" {
 		return nil
 	}
-	metaPath := filepath.Join(safeRoot, "MTD_MSIL2A.xml")
+	metaPath := filepath.Join(filepath.Clean(safeRoot), "MTD_MSIL2A.xml")
 	f, err := os.Open(metaPath)
 	if err != nil {
 		return nil
@@ -280,11 +280,11 @@ func referenceBandCandidates(spec ModelSpec) []string {
 }
 
 func bandFile(tile SafeTile, band string) string {
-    suffix := "_" + strings.ToUpper(strings.TrimSpace(band)) + ".JP2"
-    if matches := recursiveJP2Matches(tile.ImgDataPath, suffix); len(matches) > 0 {
-	return matches[0]
-    }
-    return filepath.Join(tile.ImgDataPath, "MISSING_"+band+".jp2")
+	suffix := "_" + strings.ToUpper(strings.TrimSpace(band)) + ".JP2"
+	if matches := recursiveJP2Matches(tile.ImgDataPath, suffix); len(matches) > 0 {
+		return matches[0]
+	}
+	return filepath.Join(tile.ImgDataPath, "MISSING_"+band+".jp2")
 }
 
 func firstJP2InDir(imgDataPath string) (string, error) {

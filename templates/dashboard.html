@@ -151,6 +151,7 @@
   window.ASIM_BOOT = {
     modelOptions: {{ model_options|tojson }},
     poligonOptions: {{ poligon_options|tojson }},
+    preprocessOptions: {{ preprocess_options|tojson }},
     currentUser: {{ {'username': user.username, 'name': user.name, 'group': user.group}|tojson }}
   };
 </script>

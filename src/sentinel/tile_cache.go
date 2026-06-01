@@ -40,7 +40,7 @@ func DefaultCashPath(configPath string) string {
 }
 
 func DefaultCashPathForYear(root string, year int) string {
-	return filepath.Join(root, fmt.Sprintf("%04d", year), "cash.json")
+	return filepath.Join(filepath.Clean(root), fmt.Sprintf("%04d", year), "cash.json")
 }
 
 func LoadTileCache(path string) (*TileCache, error) {

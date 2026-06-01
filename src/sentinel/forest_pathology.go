@@ -224,7 +224,7 @@ func runForestPathologyOnTile(tile SafeTile, allowedGeom Geometry, workDir strin
 	}
 
 	// Записываем маску в GeoTIFF.
-	maskTif := filepath.Join(workDir, fmt.Sprintf("fp_%s_mask.tif", tile.TileID))
+	maskTif := filepath.Join(workDir, fmt.Sprintf("fp_%s_mask.tif", safeName(tile.TileID)))
 	if err := WriteGeoTIFF1(maskTif, mask, w, h, brB05.geo, brB05.proj); err != nil {
 		return "", fmt.Errorf("write mask tif: %w", err)
 	}
@@ -611,7 +611,7 @@ func runForestPathologyDiffOnTile(tileNew, tileBase SafeTile, workDir string, mi
 		}
 	}
 
-	maskTif := filepath.Join(workDir, fmt.Sprintf("fpdiff_%s_mask.tif", tileNew.TileID))
+	maskTif := filepath.Join(workDir, fmt.Sprintf("fpdiff_%s_mask.tif", safeName(tileNew.TileID)))
 	defer os.Remove(maskTif)
 	if err := WriteGeoTIFF1(maskTif, mask, newW, newH, newGeo, newProj); err != nil {
 		return "", fmt.Errorf("write mask: %w", err)
@@ -633,7 +633,7 @@ func polygonizeWithThreshold(tile SafeTile, vog1 []float32, w, h int, geo [6]flo
 			mask[i] = 1
 		}
 	}
-	maskTif := filepath.Join(workDir, fmt.Sprintf("fpdiff_%s_%s_mask.tif", tile.TileID, tile.Date))
+	maskTif := filepath.Join(workDir, fmt.Sprintf("fpdiff_%s_%s_mask.tif", safeName(tile.TileID), safeName(tile.Date)))
 	defer os.Remove(maskTif)
 	if err := WriteGeoTIFF1(maskTif, mask, w, h, geo, proj); err != nil {
 		return "", fmt.Errorf("write mask: %w", err)
@@ -665,7 +665,7 @@ func polygonizePathologyTile(tile SafeTile, workDir string, minArea, simplify fl
 			mask[i] = 1
 		}
 	}
-	maskTif := filepath.Join(workDir, fmt.Sprintf("fpdiff_%s_%s_mask.tif", tile.TileID, tile.Date))
+	maskTif := filepath.Join(workDir, fmt.Sprintf("fpdiff_%s_%s_mask.tif", safeName(tile.TileID), safeName(tile.Date)))
 	defer os.Remove(maskTif)
 	if err := WriteGeoTIFF1(maskTif, mask, w, h, geo, proj); err != nil {
 		return "", fmt.Errorf("write mask: %w", err)

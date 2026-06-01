@@ -43,6 +43,8 @@ func MaybeDumpPatch(patch, pred []float32, channels, h, w int, tileLabel string,
 		log.Printf("dump: mkdir failed: %v", err)
 		return
 	}
+	// Канонизируем dumpDir чтобы исключить .. и symlink-переходы
+	dumpDir = filepath.Clean(dumpDir)
 
 	// Сохраняем входной тензор
 	if err := writeFloat32Bin(filepath.Join(dumpDir, "patch_input.bin"), patch); err != nil {

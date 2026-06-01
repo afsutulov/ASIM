@@ -1,17 +1,28 @@
 {
   "logs": "/var/log/asim",
   "path": "/opt/asim",
-  "satellite": "/mnt/nfs-share/newest",
-  "sentinel": "/mnt/nfs-share/newest/Sentinel2_L1C",
-  "sentinel2A": "/mnt/nfs-share/newest/Sentinel2_L2A",
+  "satellite": "/mnt/share/newest",
+  "sentinel": "/mnt/share/newest/Sentinel2_L1C",
+  "sentinel2A": "/mnt/share/newest/Sentinel2_L2A",
   "tmp": "/mnt/data",
   "users": "/opt/asim/data/users.json",
   "poli_path": "/opt/asim/poligons",
   "poligons": "/opt/asim/data/poligons.json",
-  "results_path": "/mnt/nfs-share/results",
+  "results_path": "/mnt/share/results",
   "results": "/opt/asim/data/results.json",
   "prosessing": "/opt/asim/data/prosessing.json",
   "models_path": "/opt/asim/models",
+  "ortophoto": "/mnt/share/newest/Ortophoto",
+  "preprocess": {
+    "sentinel": {
+      "name": "Поиск объектов по спутниковым снимкам Sentinel2",
+      "list": ["sentinel", "sentinel2A", "identity", "pathology"]
+    },
+    "ortophoto": {
+      "name": "Поиск объектов по ортофото снимкам",
+      "list": ["ortophoto"]
+    }
+  },
   "models": {
     "hogweed": {
       "description": "Зарастание Борщевиком Сосновского",
@@ -279,6 +290,21 @@
         "connectivity": 4
       },
       "preserve_native_resolution": true
+    },
+    "uchastki": {
+      "description": "Границы земельных участков по ортофото снимкам)",
+      "onnx_file": "uchastki.onnx",
+      "channels": ["R", "G", "B"],
+      "tile": 512,
+      "bound": 32,
+      "threshold": 0.5,
+      "preprocess": "ortophoto",
+      "inputs": 1,
+      "min_area": 10,
+      "simplify": 0,
+      "merge": false,
+      "input_name": "input",
+      "output_name": "logits"
     }
   }
 }

@@ -16,7 +16,6 @@ from flask import (
     Flask,
     abort,
     jsonify,
-    redirect,
     render_template,
     request,
     send_file,
@@ -288,8 +287,27 @@ def is_admin(user: dict[str, Any]) -> bool:
 def model_options(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     items = []
     for key, value in cfg.get("models", {}).items():
-        items.append({"key": key, "description": value.get("description", key), "inputs": int(value.get("inputs", 1)), "season": value.get("season", "")})
+        items.append({
+            "key": key,
+            "description": value.get("description", key),
+            "inputs": int(value.get("inputs", 1)),
+            "season": value.get("season", ""),
+            "preprocess": str(value.get("preprocess", "sentinel")).strip().lower(),
+        })
     return sorted(items, key=lambda item: item["description"])
+
+
+def preprocess_options(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    items = []
+    for key, value in cfg.get("preprocess", {}).items():
+        if not isinstance(value, dict):
+            continue
+        items.append({
+            "key": key,
+            "name": value.get("name", key),
+            "list": value.get("list", []),
+        })
+    return sorted(items, key=lambda item: item["name"])
 
 
 def processing_poligon_options(cfg: dict[str, Any]) -> list[dict[str, str]]:
@@ -316,6 +334,8 @@ def visible_poligons_for_user(cfg: dict[str, Any], user: dict[str, Any]) -> dict
 def format_date(date_str: str | None) -> str:
     if not date_str:
         return "—"
+    if re.fullmatch(r"\d{4}", str(date_str)):
+        return str(date_str)
     for fmt_in, fmt_out in [
         ("%Y-%m-%d", "%d.%m.%Y"),
         ("%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M"),
@@ -361,7 +381,7 @@ def enrich_rows(source: dict[str, Any], cfg: dict[str, Any], include_download: b
         }
         if include_download:
             row["download_url"] = url_for("download_result", item_uuid=item_uuid)
-            row["download_path"] = str(results_root / f"{item_uuid}.zip")
+            row["download_path"] = str(safe_join(results_root, f"{item_uuid}.zip"))
         rows.append(row)
     rows.sort(key=lambda x: parse_dt(x["raw_time"]), reverse=True)
     return rows
@@ -457,6 +477,23 @@ def safe_target(root_dir: Path, rel: str) -> Path:
     return target
 
 
+def safe_join(root_dir: Path, filename: str) -> Path:
+    """Строит путь root_dir/filename и проверяет, что результат не выходит за пределы root_dir.
+    Принимает только имя файла (без подкаталогов), что исключает подмену пути
+    через вложенные компоненты вроде ../../etc. При нарушении границ возвращает 403."""
+    target = (root_dir / filename).resolve()
+    try:
+        target.relative_to(root_dir.resolve())
+    except ValueError:
+        abort(403)
+    return target
+
+
+def validate_uuid(value: str) -> bool:
+    """Проверяет, что строка является корректным UUID (только hex-символы и дефисы)."""
+    return bool(re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", value.lower()))
+
+
 
 
 @app.after_request
@@ -479,7 +516,8 @@ def unauthorized(_: Any):
     if wants_json_response():
         log_request_failure(401)
         return jsonify({"error": "Требуется авторизация"}), 401
-    return redirect(url_for("login"))
+    log_request_failure(401)
+    return render_template("login.html", error=None), 401
 
 
 @app.errorhandler(403)
@@ -520,31 +558,45 @@ def handle_exception(error: Exception):
 def root():
     user = current_user()
     if not user:
-        return redirect(url_for("login"))
+        return render_template("login.html", error=None), 200
     if user.get("group") == "satellite":
-        return redirect(url_for("satellite_browser"))
-    return redirect(url_for("dashboard"))
+        return satellite_browser()
+    return dashboard()
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
+        # Поддерживаем как JSON (fetch из JS), так и form-data (fallback)
+        if request.is_json:
+            payload = request.get_json(silent=True) or {}
+            username = (payload.get("username") or "").strip()
+            password = payload.get("password") or ""
+        else:
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "")
         try:
             cfg = runtime.load_config()
             users = runtime.load_users(cfg)
         except Exception as exc:
             write_web_log("login", username, False, "reason=config_error")
+            if request.is_json:
+                return jsonify({"error": str(exc)}), 500
             return render_template("login.html", error=str(exc)), 500
         user = users.get(username)
         if user and verify_password(user.get("password", ""), password):
             session.clear()
             session["username"] = username
             write_web_log("login", username, True)
-            return redirect(url_for("root"))
+            # Возвращаем JSON — JS на клиенте сам выполнит переход через window.location.href,
+            # что исключает серверный redirect и решает проблему POST/Redirect/Get без redirect.
+            group = user.get("group", "user")
+            target = "/satellite" if group == "satellite" else "/dashboard"
+            return jsonify({"ok": True, "next": target})
         write_web_log("login", username, False, "reason=invalid_credentials")
+        if request.is_json:
+            return jsonify({"error": "Неверное имя пользователя или пароль"}), 401
         error = "Неверное имя пользователя или пароль"
     return render_template("login.html", error=error)
 
@@ -555,14 +607,14 @@ def logout():
     if user:
         write_web_log("logout", user["username"], True)
     session.clear()
-    return redirect(url_for("login"))
+    return render_template("login.html", error=None), 200
 
 
 @app.route("/dashboard")
 def dashboard():
     user = require_any_group("admin", "user")
     cfg = runtime.load_config()
-    return render_template("dashboard.html", user=user, model_options=model_options(cfg), poligon_options=processing_poligon_options(cfg))
+    return render_template("dashboard.html", user=user, model_options=model_options(cfg), poligon_options=processing_poligon_options(cfg), preprocess_options=preprocess_options(cfg))
 
 
 @app.route("/api/session")
@@ -615,9 +667,18 @@ def season_to_dates(season: str, year: int) -> tuple[str, str]:
     end = f"{year + 1}-{end_md}" if season == "winter" else f"{year}-{end_md}"
     return start, end
 
-def available_years(cfg: dict[str, Any]) -> list[int]:
-    sentinel_dir = resolve_path(cfg.get("sentinel") or cfg.get("satellite"), BASE_DIR / "sentinel")
+def available_years(cfg: dict[str, Any], source: str = "sentinel") -> list[int]:
     years = []
+    source = (source or "sentinel").strip().lower()
+    if source == "ortophoto":
+        ortho_dir = resolve_path(cfg.get("ortophoto"), BASE_DIR / "ortophoto")
+        if ortho_dir.exists():
+            for entry in sorted(ortho_dir.iterdir()):
+                if entry.is_dir() and entry.name.isdigit() and len(entry.name) == 4:
+                    years.append(int(entry.name))
+        return sorted(years)
+
+    sentinel_dir = resolve_path(cfg.get("sentinel") or cfg.get("satellite"), BASE_DIR / "sentinel")
     if sentinel_dir.exists():
         for entry in sorted(sentinel_dir.iterdir()):
             if entry.is_dir() and entry.name.isdigit() and len(entry.name) == 4:
@@ -628,7 +689,8 @@ def available_years(cfg: dict[str, Any]) -> list[int]:
 @app.route("/api/available-years")
 def api_available_years():
     require_any_group("admin", "user")
-    return jsonify(available_years(runtime.load_config()))
+    source = request.args.get("source", "sentinel")
+    return jsonify(available_years(runtime.load_config(), source))
 
 
 @app.route("/api/processing/create", methods=["POST"])
@@ -636,63 +698,91 @@ def create_processing():
     user = require_any_group("admin", "user")
     cfg = runtime.load_config()
     payload = request.get_json(silent=True) or {}
+
+    preprocess_key = str(payload.get("preprocess") or "sentinel").strip().lower()
     model_key = payload.get("model")
-    cloud = int(payload.get("cloud", 50))
     poligon = payload.get("poligon")
+
+    preprocess_cfg = cfg.get("preprocess", {}).get(preprocess_key, {})
+    allowed_preprocesses = {str(v).strip().lower() for v in preprocess_cfg.get("list", [])}
+    if not preprocess_cfg:
+        return jsonify({"error": "Неизвестный источник обработки"}), 400
 
     if model_key not in cfg.get("models", {}):
         return jsonify({"error": "Неизвестная модель"}), 400
     if poligon not in {item['key'] for item in processing_poligon_options(cfg)}:
         return jsonify({"error": "Нужно выбрать локацию"}), 400
-    if cloud < 0 or cloud > 100:
-        return jsonify({"error": "Облачность должна быть от 0 до 100"}), 400
 
     model_spec = cfg["models"][model_key]
+    model_preprocess = str(model_spec.get("preprocess", "sentinel")).strip().lower()
+    if model_preprocess not in allowed_preprocesses:
+        return jsonify({"error": "Выбранная модель не подходит для указанного источника"}), 400
+
     is_two_input = int(model_spec.get("inputs", 1)) == 2
     season = model_spec.get("season", "")
 
-    if season:
-        # Сезонная модель: даты вычисляются из года.
-        # Работает независимо от inputs — год выбирается всегда когда задан season.
+    if preprocess_key == "ortophoto":
         try:
-            year = int(payload.get("year", 0))
+            start_year = int(payload.get("start"))
+            end_year = int(payload.get("end"))
         except (ValueError, TypeError):
-            return jsonify({"error": "Укажите корректный год"}), 400
-        if not year:
-            return jsonify({"error": "Нужно выбрать год снимка"}), 400
-        start, end = season_to_dates(season, year)
-        start2, end2 = None, None
-        if is_two_input:
-            try:
-                year2 = int(payload.get("year2", 0))
-            except (ValueError, TypeError):
-                return jsonify({"error": "Укажите корректный год базового снимка"}), 400
-            if not year2:
-                return jsonify({"error": "Нужно выбрать год базового снимка"}), 400
-            if year == year2:
-                return jsonify({"error": "Год нового и базового снимка должны отличаться"}), 400
-            start2, end2 = season_to_dates(season, year2)
+            return jsonify({"error": "Нужно указать корректные годы обработки"}), 400
+        available = set(available_years(cfg, "ortophoto"))
+        if start_year > end_year:
+            return jsonify({"error": "Год начала не может быть больше года завершения"}), 400
+        if available and (start_year not in available or end_year not in available):
+            return jsonify({"error": "Выбранный год отсутствует в хранилище ортофото"}), 400
+        entry = {
+            "model": model_key,
+            "poligon": poligon,
+            "start": str(start_year),
+            "end": str(end_year),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
     else:
-        start = payload.get("start")
-        end = payload.get("end")
-        start2 = payload.get("start2")
-        end2 = payload.get("end2")
-        if not start or not end:
-            return jsonify({"error": "Нужно заполнить даты начала и завершения"}), 400
-        if is_two_input and (not start2 or not end2):
-            return jsonify({"error": "Для модели с двумя входами нужны start2 и end2"}), 400
+        cloud = int(payload.get("cloud", 50))
+        if cloud < 0 or cloud > 100:
+            return jsonify({"error": "Облачность должна быть от 0 до 100"}), 400
 
-    # Формат JSON остаётся прежним
-    entry = {"model": model_key, "poligon": poligon, "cloud": cloud, "start": start, "end": end, "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
-    if is_two_input:
-        entry["start2"] = start2
-        entry["end2"] = end2
+        if season:
+            try:
+                year = int(payload.get("year", 0))
+            except (ValueError, TypeError):
+                return jsonify({"error": "Укажите корректный год"}), 400
+            if not year:
+                return jsonify({"error": "Нужно выбрать год снимка"}), 400
+            start, end = season_to_dates(season, year)
+            start2, end2 = None, None
+            if is_two_input:
+                try:
+                    year2 = int(payload.get("year2", 0))
+                except (ValueError, TypeError):
+                    return jsonify({"error": "Укажите корректный год базового снимка"}), 400
+                if not year2:
+                    return jsonify({"error": "Нужно выбрать год базового снимка"}), 400
+                if year == year2:
+                    return jsonify({"error": "Год нового и базового снимка должны отличаться"}), 400
+                start2, end2 = season_to_dates(season, year2)
+        else:
+            start = payload.get("start")
+            end = payload.get("end")
+            start2 = payload.get("start2")
+            end2 = payload.get("end2")
+            if not start or not end:
+                return jsonify({"error": "Нужно заполнить даты начала и завершения"}), 400
+            if is_two_input and (not start2 or not end2):
+                return jsonify({"error": "Для модели с двумя входами нужны start2 и end2"}), 400
+
+        entry = {"model": model_key, "poligon": poligon, "cloud": cloud, "start": start, "end": end, "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
+        if is_two_input:
+            entry["start2"] = start2
+            entry["end2"] = end2
 
     data = runtime.load_processing(cfg)
     item_uuid = str(uuid.uuid4())
     data[item_uuid] = entry
     runtime.save_processing(cfg, data)
-    write_web_log("processing_create", user["username"], True, f"uuid={item_uuid} model={model_key} poligon={poligon}")
+    write_web_log("processing_create", user["username"], True, f"uuid={item_uuid} model={model_key} poligon={poligon} preprocess={preprocess_key}")
     return jsonify({"ok": True, "uuid": item_uuid})
 
 
@@ -714,13 +804,17 @@ def delete_processing(item_uuid: str):
 def delete_result(item_uuid: str):
     user = require_any_group("admin", "user")
     cfg = runtime.load_config()
+    if not validate_uuid(item_uuid):
+        write_web_log("result_delete", user["username"], False, f"uuid={item_uuid} reason=invalid_uuid")
+        return jsonify({"error": "Некорректный идентификатор результата"}), 400
+    cfg = runtime.load_config()
     data = runtime.load_results(cfg)
     if item_uuid not in data:
         write_web_log("result_delete", user["username"], False, f"uuid={item_uuid} reason=not_found")
         return jsonify({"error": "Результат не найден"}), 404
     del data[item_uuid]
     save_json(runtime.results_json_path(cfg), data)
-    result_file = runtime.results_zip_root(cfg) / f"{item_uuid}.zip"
+    result_file = safe_join(runtime.results_zip_root(cfg), f"{item_uuid}.zip")
     if result_file.exists():
         result_file.unlink()
     write_web_log("result_delete", user["username"], True, f"uuid={item_uuid}")
@@ -729,9 +823,12 @@ def delete_result(item_uuid: str):
 
 @app.route("/results/download/<item_uuid>")
 def download_result(item_uuid: str):
-    require_any_group("admin", "user")
+    user = require_any_group("admin", "user")
+    if not validate_uuid(item_uuid):
+        write_web_log("result_download", user["username"], False, f"uuid={item_uuid} reason=invalid_uuid")
+        abort(400)
     cfg = runtime.load_config()
-    result_file = runtime.results_zip_root(cfg) / f"{item_uuid}.zip"
+    result_file = safe_join(runtime.results_zip_root(cfg), f"{item_uuid}.zip")
     if not result_file.exists():
         abort(404)
     return send_file(result_file, as_attachment=True, download_name=f"{item_uuid}.zip")
@@ -783,7 +880,7 @@ def api_poligons_create():
         if not os.access(poli_root, os.W_OK):
             raise PermissionError(f"Нет прав на запись в каталог {poli_root}")
         _, geojson_bytes = load_geojson_payload()
-        target_file = poli_root / f"{identifier}.geojson"
+        target_file = safe_join(poli_root, f"{identifier}.geojson")
         save_geojson_bytes(target_file, geojson_bytes)
         poligons[identifier] = {"name": name, "public": public}
         runtime.save_poligons(cfg, poligons)
@@ -807,7 +904,7 @@ def api_poligon_detail(identifier: str):
     if not item:
         write_web_log("poligon_delete", user["username"], False, f"id={identifier} reason=not_found")
         return jsonify({"error": "Полигон не найден"}), 404
-    file_exists = (runtime.poli_root(cfg) / f"{identifier}.geojson").exists()
+    file_exists = safe_join(runtime.poli_root(cfg), f"{identifier}.geojson").exists()
     return jsonify({
         "id": identifier,
         "name": item.get("name", identifier),
@@ -853,8 +950,8 @@ def api_poligon_update(identifier: str):
         if new_identifier != identifier and new_identifier in poligons:
             raise ConfigError("Полигон с таким идентификатором уже существует")
 
-        old_file = poli_root / f"{identifier}.geojson"
-        new_file = poli_root / f"{new_identifier}.geojson"
+        old_file = safe_join(poli_root, f"{identifier}.geojson")
+        new_file = safe_join(poli_root, f"{new_identifier}.geojson")
         if replace_file:
             _, geojson_bytes = load_geojson_payload()
             if old_file.exists() and old_file != new_file:
@@ -894,7 +991,7 @@ def api_poligon_delete(identifier: str):
         return jsonify({"error": "Недостаточно прав"}), 403
     del poligons[identifier]
     runtime.save_poligons(cfg, poligons)
-    geo = runtime.poli_root(cfg) / f"{identifier}.geojson"
+    geo = safe_join(runtime.poli_root(cfg), f"{identifier}.geojson")
     if geo.exists():
         geo.unlink()
     write_web_log("poligon_delete", user["username"], True, f"id={identifier}")

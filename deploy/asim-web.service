@@ -9,7 +9,6 @@ WorkingDirectory=/opt/asim
 Environment=ASIM_CONFIG=/opt/asim/data/config.json
 Environment=ASIM_PROCESSING=/opt/asim/data/prosessing.json
 Environment=ASIM_RESULTS=/opt/asim/data/results.json
-Environment=ASIM_SECRET_KEY=change-this-secret
 ExecStart=/opt/asim/venv/bin/python /opt/asim/app.py
 Restart=always
 RestartSec=3

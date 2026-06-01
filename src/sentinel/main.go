@@ -77,8 +77,9 @@ func main() {
 	outputName := flag.String("out", "", "Имя выходного архива zip без пути")
 	minAreaFlag := flag.Float64("min-area", 0, "Минимальная площадь полигона (если 0, берется из модели)")
 	simplifyFlag := flag.Float64("simplify", 0, "Упрощение геометрии (если 0, берется из модели)")
-	device := flag.String("device", "cuda", "Тип расчетов: cpu|cuda")
-	cudaID := flag.Int("cuda-device", 0, "Номер GPU для ONNX Runtime")
+	device := flag.String("device", "", "Тип расчетов: cpu|gpu. Если не задан, берется из config.json")
+	gpuDevices := flag.String("gpu-devices", "", "Список GPU через запятую, например 0,1. Если не задан, берется из config.json")
+	cudaID := flag.Int("cuda-device", -1, "Устаревший параметр: номер GPU для ONNX Runtime")
 	batch := flag.Int("batch", 4, "Сколько тайлов обрабатывается за один вызов модели")
 	start := flag.String("start", "", "Начало периода YYYY-MM-DD")
 	end := flag.String("end", "", "Конец периода YYYY-MM-DD")
@@ -126,13 +127,18 @@ func main() {
 		os.Exit(2)
 	}
 
-	dev := strings.ToLower(strings.TrimSpace(*device))
-	if dev != "cpu" && dev != "cuda" && dev != "gpu" {
-		fmt.Fprintln(os.Stderr, "Укажите --device cpu или --device cuda")
+	overrideGPUList, err := parseGPUList(*gpuDevices)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Ошибка в --gpu-devices:", err)
 		os.Exit(2)
 	}
-	if dev == "gpu" {
-		dev = "cuda"
+	if *cudaID >= 0 && len(overrideGPUList) == 0 {
+		overrideGPUList = []int{*cudaID}
+	}
+	runtimeDevice := resolveRuntimeDevice(ComputeConfig{Device: cfg.Compute.Device, GPUs: cfg.Compute.GPUs}, *device, overrideGPUList, "", 0)
+	if runtimeDevice.Device != "cpu" && runtimeDevice.Device != "cuda" {
+		fmt.Fprintln(os.Stderr, "Укажите --device cpu или --device gpu")
+		os.Exit(2)
 	}
 
 	spec, ok := GetModelSpec(strings.ToLower(strings.TrimSpace(*modelName)))
@@ -177,8 +183,8 @@ func main() {
 		Cloud:         *cloud,
 		SearchPolygon: *poligon,
 		BatchSize:     *batch,
-		Device:        dev,
-		CudaDeviceID:  *cudaID,
+		Device:        runtimeDevice.Device,
+		GPUDevices:    runtimeDevice.GPUs,
 		OutputName:    *outputName,
 		CashPath:      *cashPath,
 	}
@@ -193,7 +199,7 @@ func main() {
 		runCfg.Simplify = spec.Simplify
 	}
 
-	log.Printf("process started: model=%s output=%s primary=%s..%s secondary=%s..%s cloud=%.2f poligon=%s device=%s batch=%d min_area=%.6f simplify=%.6f cash=%s", spec.Name, runCfg.OutputName, runCfg.Start, runCfg.End, runCfg.Start2, runCfg.End2, runCfg.Cloud, runCfg.SearchPolygon, runCfg.Device, runCfg.BatchSize, runCfg.MinArea, runCfg.Simplify, runCfg.CashPath)
+	log.Printf("process started: model=%s output=%s primary=%s..%s secondary=%s..%s cloud=%.2f poligon=%s device=%s gpus=%v batch=%d min_area=%.6f simplify=%.6f cash=%s", spec.Name, runCfg.OutputName, runCfg.Start, runCfg.End, runCfg.Start2, runCfg.End2, runCfg.Cloud, runCfg.SearchPolygon, runCfg.Device, runCfg.GPUDevices, runCfg.BatchSize, runCfg.MinArea, runCfg.Simplify, runCfg.CashPath)
 	zipPath, stats, err := RunProcess(runCfg)
 	if err != nil {
 		log.Printf("processing failed: %v; primary_candidates=%d secondary_candidates=%d footprints_seen=%d tiles_processed=%d tiles_skipped_outside=%d tiles_read_errors=%d model_runs=%d model_errors=%d secondary_misses=%d result_polygons=%d", err, stats.PrimaryCandidates, stats.SecondaryCandidates, stats.TileFootprintsSeen, stats.TilesProcessed, stats.TilesSkippedOutside, stats.TilesReadErrors, stats.ModelRuns, stats.ModelErrors, stats.SecondaryMisses, stats.ResultPolygons)

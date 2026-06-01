@@ -154,7 +154,7 @@ func SieveMergedShapefile(srcShp, dstShp string, spec ModelSpec) error {
 		return fmt.Errorf("GDALSieveFilter failed")
 	}
 
-	tmpTif := strings.TrimSuffix(dstShp, filepath.Ext(dstShp)) + ".tmp.tif"
+	tmpTif := strings.TrimSuffix(filepath.Clean(dstShp), filepath.Ext(dstShp)) + ".tmp.tif"
 	gtiffName := C.CString("GTiff")
 	defer C.free(unsafe.Pointer(gtiffName))
 	gtiff := C.GDALGetDriverByName(gtiffName)
@@ -169,7 +169,7 @@ func SieveMergedShapefile(srcShp, dstShp string, spec ModelSpec) error {
 	}
 	C.GDALClose(copyDS)
 	defer func() { _ = os.Remove(tmpTif) }()
-	polyShp := strings.TrimSuffix(dstShp, filepath.Ext(dstShp)) + ".tmp_poly.shp"
+	polyShp := strings.TrimSuffix(filepath.Clean(dstShp), filepath.Ext(dstShp)) + ".tmp_poly.shp"
 	if err := PolygonizeMaskToShapefile(tmpTif, polyShp, spec.MinArea, spec.Simplify); err != nil {
 		return DissolveOverlappingPolygons(srcShp, dstShp)
 	}
