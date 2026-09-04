@@ -334,16 +334,28 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 	}
 	defer closeORTSessions(sessions)
 
-	shpDir := filepath.Join(workDir, "Shp")
+	// Внутренний накопитель всегда создаётся в метрической МСК-59. Зона выбирается
+	// один раз для всей задачи по центру поискового полигона WGS84 и больше не
+	// зависит от порядка/CRS входных GeoTIFF. Исходные растры НЕ перепроецируются:
+	// YOLO получает исходные пиксели, а векторные результаты приводятся к МСК-59.
+	shpDir := filepath.Join(workDir, "_internal_shp")
 	if err := os.MkdirAll(shpDir, 0o755); err != nil {
 		return "", stats, err
 	}
-	// Накопительный shapefile хранит результат в исходной проекции снимков (МСК-59,
-	// зона определяется по первому обработанному снимку). Никакого прохода через
-	// WGS84 здесь нет: это важно, поскольку результат впоследствии сверяется
-	// с кадастровыми данными и требует точной координатной привязки.
 	resultShp := filepath.Join(shpDir, safeName(cfg.Spec.Name)+".shp")
-	accumulatorReady := false
+	searchEnv := GeometryEnvelope(allowedGeom)
+	targetZone := MSK59ZoneForLongitude((searchEnv.MinX + searchEnv.MaxX) / 2)
+	targetSRS, err := NewMSK59SRS(targetZone)
+	if err != nil {
+		return "", stats, fmt.Errorf("create target MSK-59 zone %d: %w", targetZone, err)
+	}
+	if err := CreateEmptyAccumulatorShapefile(resultShp, targetSRS); err != nil {
+		DestroySRS(targetSRS)
+		return "", stats, err
+	}
+	DestroySRS(targetSRS)
+	accumulatorReady := true
+	log.Printf("ortophoto result CRS: MSK-59 zone=%d search_center_lon=%.6f", targetZone, (searchEnv.MinX+searchEnv.MaxX)/2)
 
 	processedDurSum := time.Duration(0)
 	for _, tif := range files {
@@ -425,10 +437,10 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 		}
 
 		fileShp := filepath.Join(workDir, safeName(strings.TrimSuffix(filepath.Base(tif), filepath.Ext(tif)))+"_tmp.shp")
-		// MinAreaM2 — фильтр площади полигона в м² (СК снимка, МСК-59);
-		// НЕ путать с MinArea (пиксели), который применяется к компонентам
-		// маски в removeSmallComponents ещё до полигонизации.
-		if err := PolygonizeMaskToShapefile(maskTif, fileShp, cfg.Spec.MinAreaM2, cfg.Spec.Simplify); err != nil {
+		// Полигонизация выполняется в РОДНОЙ CRS снимка без метрических операций.
+		// min_area_m2 и simplify применяются позже, после перевода геометрии в
+		// целевую МСК-59, где единицы гарантированно являются метрами.
+		if err := PolygonizeMaskToShapefile(maskTif, fileShp, 0, 0); err != nil {
 			log.Printf("ortophoto polygonize failed: file=%s error=%v", tif, err)
 			imgStat.Skipped = true
 			imgStat.SkipReason = err.Error()
@@ -446,30 +458,20 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 		if err := ClipShapefileToGeometryWithSRSWKT(fileShp, clippedShp, allowedGeom, img.Proj); err != nil {
 			return "", stats, err
 		}
-		polyCount, err := countVectorFeatures(clippedShp)
+		nativeCount, err := countVectorFeatures(clippedShp)
 		if err != nil {
 			return "", stats, err
 		}
-		log.Printf("ortophoto vectors: file=%s features=%d", filepath.Base(tif), polyCount)
-		if polyCount > 0 {
-			if !accumulatorReady {
-				// Первая партия полигонов задаёт целевую СК результата — МСК-59
-				// нужной зоны, считанную напрямую из текущего снимка/clippedShp.
-				srs, err := ReadLayerSRS(clippedShp)
-				if err != nil {
-					return "", stats, fmt.Errorf("read clipped layer SRS: %w", err)
-				}
-				if err := CreateEmptyAccumulatorShapefile(resultShp, srs); err != nil {
-					DestroySRS(srs)
-					return "", stats, err
-				}
-				DestroySRS(srs)
-				accumulatorReady = true
-			}
-			if err := AppendShapefileToAccumulator(clippedShp, resultShp); err != nil {
+		polyCount := 0
+		if nativeCount > 0 {
+			polyCount, err = AppendShapefileToAccumulatorFiltered(
+				clippedShp, resultShp, img.Proj, targetZone, cfg.Spec.MinAreaM2, cfg.Spec.Simplify,
+			)
+			if err != nil {
 				return "", stats, err
 			}
 		}
+		log.Printf("ortophoto vectors: file=%s native_features=%d accepted_msk59_features=%d", filepath.Base(tif), nativeCount, polyCount)
 		removeShapefileSet(fileShp)
 		removeShapefileSet(clippedShp)
 
@@ -489,32 +491,24 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 		stats.AvgPerImage = processedDurSum / time.Duration(stats.FilesProcessed)
 	}
 
-	if !accumulatorReady {
-		// Полигонов не найдено ни на одном снимке — создаём пустой shapefile
-		// в СК первого снимка набора данных, чтобы результат был валидным.
-		if len(files) > 0 {
-			// Достаточно метаданных: раньше здесь читался ВЕСЬ растр
-			// (гигабайты) только ради строки проекции.
-			probeInfo, err := ReadOrthophotoInfo(files[0])
-			if err == nil {
-				srs, srsErr := projSRSFromWKT(probeInfo.Proj)
-				if srsErr == nil {
-					_ = CreateEmptyAccumulatorShapefile(resultShp, srs)
-					DestroySRS(srs)
-				}
-			}
-		}
-		if _, err := os.Stat(resultShp); err != nil {
-			if err := CreateEmptyShapefile(resultShp); err != nil {
-				return "", stats, err
-			}
-		}
-	}
+	_ = accumulatorReady // accumulator is created before processing; kept for compatibility with older stats flow.
 
-	// Экспорт результата в GeoJSON в ТОЙ ЖЕ СК (МСК-59), без репроекции —
-	// итоговый архив должен содержать оба формата: Shp/ (shapefile) и geojson.
-	geojsonPath := filepath.Join(workDir, safeName(cfg.Spec.Name)+".geojson")
-	if err := ExportShapefileToGeoJSON(resultShp, geojsonPath); err != nil {
+	// Публичный результат: два GeoJSON.
+	// 1) МСК-59 выбранной зоны — для метрических/GIS/кадастровых операций.
+	//    Это GeoJSON 2008 с явным CRS (не RFC 7946).
+	// 2) WGS84 / EPSG:4326 — стандартный обменный/веб-вариант.
+	baseName := safeName(cfg.Spec.Name)
+	mskGeoJSON := filepath.Join(workDir, fmt.Sprintf("%s_MSK59-%d.geojson", baseName, targetZone))
+	wgsGeoJSON := filepath.Join(workDir, baseName+"_WGS84_EPSG4326.geojson")
+	if err := ExportShapefileToGeoJSON(resultShp, mskGeoJSON); err != nil {
+		return "", stats, err
+	}
+	if err := ConvertShapefileToGeoJSONMSK59(resultShp, wgsGeoJSON, targetZone); err != nil {
+		return "", stats, err
+	}
+	// Shapefile — только внутренний транспортный формат конвейера; пользователю
+	// он не нужен и в ZIP не включается.
+	if err := os.RemoveAll(shpDir); err != nil {
 		return "", stats, err
 	}
 
@@ -533,7 +527,7 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 	}
 	// result.json пишем внутри workDir для удобства отладки (он будет удалён
 	// вместе с workDir по defer), но НЕ включаем его в итоговый zip-архив —
-	// в архиве должны быть только Shp/ и geojson.
+	// в архиве должны быть только два публичных GeoJSON (и debug CSV, если включён dump_candidates).
 	manifestPath := filepath.Join(workDir, "result.json")
 	blob, _ := json.MarshalIndent(manifest, "", "  ")
 	if err := os.WriteFile(manifestPath, blob, 0o644); err != nil {

@@ -427,30 +427,29 @@ func ReadLayerSRS(path string) (C.OGRSpatialReferenceH, error) {
 	return C._clone_srs(lsrs), nil
 }
 
-// AppendShapefileToAccumulator переносит геометрии из srcShp (СК снимка — МСК-59 нужной
-// зоны) в накопительный shapefile outShp, который уже создан в целевой СК (СК первого
-// снимка результата). Если СК снимка отличается зоной МСК-59 от целевой СК, выполняется
-// прямая трансформация зона -> зона (общий датум Pulkovo 1942), БЕЗ прохода через WGS84 —
-// это критично для точности результата, который впоследствии сверяется с кадастром.
-func AppendShapefileToAccumulator(srcShp string, outShp string) error {
+// AppendShapefileToAccumulatorFiltered переносит геометрии из native CRS снимка
+// в фиксированную для задания зону МСК-59. После трансформации применяет
+// метрические min_area_m2 и simplify. Полный WKT исходного GeoTIFF передаётся
+// отдельно, чтобы не терять BOUNDCRS/датум-трансформацию через Shapefile .prj.
+func AppendShapefileToAccumulatorFiltered(srcShp string, outShp string, sourceWKT string, targetMSK59Zone int, minAreaM2, simplifyMetres float64) (int, error) {
 	C._gdal_init_vector_once()
 
 	srcCP := C.CString(srcShp)
 	defer C.free(unsafe.Pointer(srcCP))
 	srcDS := C.GDALOpenEx(srcCP, C.GDAL_OF_VECTOR, nil, nil, nil)
 	if srcDS == nil {
-		return fmt.Errorf("open source vector: %s", srcShp)
+		return 0, fmt.Errorf("open source vector: %s", srcShp)
 	}
 	defer C.GDALClose(srcDS)
 
 	srcLayer := C.GDALDatasetGetLayer(srcDS, 0)
 	if srcLayer == nil {
-		return fmt.Errorf("source layer not found: %s", srcShp)
+		return 0, fmt.Errorf("source layer not found: %s", srcShp)
 	}
 
 	dstDS, dstLayer, err := openLayerForAppend(outShp)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer C.GDALClose(dstDS)
 
@@ -460,13 +459,29 @@ func AppendShapefileToAccumulator(srcShp string, outShp string) error {
 	srcDNIndex := C.OGR_FD_GetFieldIndex(C.OGR_L_GetLayerDefn(srcLayer), fdDN)
 	dstDNIndex := C.OGR_FD_GetFieldIndex(dstDefn, fdDN)
 
+	// Используем полный WKT ИСХОДНОГО GeoTIFF, если он передан. Shapefile .prj
+	// может потерять BOUNDCRS/параметры датум-трансформации МСК-59 -> WGS84.
 	var srcSRS C.OGRSpatialReferenceH
-	if lsrs := C.OGR_L_GetSpatialRef(srcLayer); lsrs != nil {
+	if strings.TrimSpace(sourceWKT) != "" {
+		parsed, perr := projSRSFromWKT(sourceWKT)
+		if perr != nil {
+			return 0, fmt.Errorf("parse source raster CRS: %w", perr)
+		}
+		srcSRS = parsed
+		defer C.OSRDestroySpatialReference(srcSRS)
+	} else if lsrs := C.OGR_L_GetSpatialRef(srcLayer); lsrs != nil {
 		srcSRS = C.OSRClone(lsrs)
 		C._set_traditional_gis_order(srcSRS)
 		defer C.OSRDestroySpatialReference(srcSRS)
 	}
-	dstSRS := C.OGR_L_GetSpatialRef(dstLayer)
+	// .prj Shapefile не сохраняет BOUNDCRS полностью. Для точной трансформации
+	// используем полное определение целевой МСК-59, а не SRS, перечитанный из .prj.
+	dstSRS, derr := NewMSK59SRS(targetMSK59Zone)
+	if derr != nil {
+		return 0, derr
+	}
+	defer C.OSRDestroySpatialReference(dstSRS)
+	accepted := 0
 
 	C.OGR_L_ResetReading(srcLayer)
 	for {
@@ -487,6 +502,22 @@ func AppendShapefileToAccumulator(srcShp string, outShp string) error {
 			C.OGR_F_Destroy(feat)
 			continue
 		}
+
+		// ВАЖНО: tg уже находится в целевой МСК-59, поэтому OGR_G_Area
+		// возвращает м², а simplifyMetres действительно измеряется в метрах
+		// независимо от исходной CRS GeoTIFF (WGS84, МСК, UTM и т.п.).
+		if minAreaM2 > 0 && float64(C.OGR_G_Area(tg)) < minAreaM2 {
+			DestroyGeometry(tg)
+			C.OGR_F_Destroy(feat)
+			continue
+		}
+		if simplifyMetres > 0 {
+			sg := C.OGR_G_SimplifyPreserveTopology(tg, C.double(simplifyMetres))
+			if sg != nil {
+				DestroyGeometry(tg)
+				tg = sg
+			}
+		}
 		normalized := toMultiPolygon(tg)
 		if normalized != tg {
 			DestroyGeometry(tg)
@@ -498,7 +529,9 @@ func AppendShapefileToAccumulator(srcShp string, outShp string) error {
 				if srcDNIndex >= 0 && dstDNIndex >= 0 {
 					C.OGR_F_SetFieldInteger(outFeat, dstDNIndex, C.OGR_F_GetFieldAsInteger(feat, srcDNIndex))
 				}
-				C.OGR_L_CreateFeature(dstLayer, outFeat)
+				if C.OGR_L_CreateFeature(dstLayer, outFeat) == 0 {
+					accepted++
+				}
 			}
 			C.OGR_F_Destroy(outFeat)
 		}
@@ -506,5 +539,11 @@ func AppendShapefileToAccumulator(srcShp string, outShp string) error {
 		C.OGR_F_Destroy(feat)
 	}
 	C.GDALFlushCache(dstDS)
-	return nil
+	return accepted, nil
+}
+
+// AppendShapefileToAccumulator сохраняет прежний API для вспомогательного кода.
+func AppendShapefileToAccumulator(srcShp string, outShp string) error {
+	_, err := AppendShapefileToAccumulatorFiltered(srcShp, outShp, "", 2, 0, 0)
+	return err
 }

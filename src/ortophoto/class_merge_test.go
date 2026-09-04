@@ -13,7 +13,7 @@ func TestClassMergePromotesTouchingSourceComponent(t *testing.T) {
 			m[y*w+x] = 2 // pavilion
 		}
 	}
-	applyClassMergeRules(m, w, h, [6]float64{0, 0.2, 0, 0, 0, -0.2}, []ClassMergeRule{{
+	applyClassMergeRules(m, w, h, [6]float64{0, 0.2, 0, 0, 0, -0.2}, "PROJCRS[\"test\"]", []ClassMergeRule{{
 		TargetClass:   0,
 		SourceClasses: []int{1},
 	}})
@@ -31,7 +31,7 @@ func TestClassMergeKeepsDetachedSource(t *testing.T) {
 	m := make([]uint16, w*h)
 	m[1*w+1] = 1
 	m[1*w+8] = 2
-	applyClassMergeRules(m, w, h, [6]float64{0, 1, 0, 0, 0, -1}, []ClassMergeRule{{
+	applyClassMergeRules(m, w, h, [6]float64{0, 1, 0, 0, 0, -1}, "PROJCRS[\"test\"]", []ClassMergeRule{{
 		TargetClass:   0,
 		SourceClasses: []int{1},
 		DistanceM:     0.3,

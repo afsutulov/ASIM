@@ -1,6 +1,9 @@
 package main
 
-import "math"
+import (
+	"math"
+	"strings"
+)
 
 // ClassMergeRule promotes whole connected components of SourceClasses to
 // TargetClass when they touch or lie within DistanceM of the target class.
@@ -14,8 +17,27 @@ type ClassMergeRule struct {
 	DistanceM     float64 `json:"distance_m,omitempty"`
 }
 
-func pixelSizeMetres(geo [6]float64) float64 {
-	// Lengths of the pixel basis vectors; works for north-up and rotated rasters.
+func pixelSizeMetres(geo [6]float64, w, h int, proj string) float64 {
+	// Для geographic CRS geotransform выражен в градусах. Переводим длины
+	// базисных векторов пикселя в метры в центре снимка. Для небольших БПЛА
+	// листов локальная аппроксимация WGS84 значительно точнее требуемых
+	// расстояний class_merge_rules (десятки сантиметров).
+	upper := strings.ToUpper(proj)
+	geographic := strings.Contains(upper, "GEOGCRS[") && !strings.Contains(upper, "PROJCRS[")
+	if geographic {
+		cx, cy := float64(w)/2, float64(h)/2
+		lat := geo[3] + cx*geo[4] + cy*geo[5]
+		latRad := lat * math.Pi / 180
+		metresPerDegLat := 111132.92 - 559.82*math.Cos(2*latRad) + 1.175*math.Cos(4*latRad)
+		metresPerDegLon := 111412.84*math.Cos(latRad) - 93.5*math.Cos(3*latRad)
+		sx := math.Hypot(geo[1]*metresPerDegLon, geo[4]*metresPerDegLat)
+		sy := math.Hypot(geo[2]*metresPerDegLon, geo[5]*metresPerDegLat)
+		if sx > 0 && sy > 0 {
+			return (sx + sy) / 2
+		}
+	}
+
+	// Projected CRS: basis vectors are expected in metres (МСК-59/UTM etc.).
 	sx := math.Hypot(geo[1], geo[4])
 	sy := math.Hypot(geo[2], geo[5])
 	if sx <= 0 {
@@ -71,11 +93,11 @@ func classMergeRulesRelevant(rules []ClassMergeRule, detectionClasses []int) boo
 // The target snapshot is fixed for the duration of a rule, preserving the
 // previous semantics: components promoted earlier by the same rule do not
 // extend the target neighbourhood for later components.
-func applyClassMergeRules(classMap []uint16, w, h int, geo [6]float64, rules []ClassMergeRule) {
+func applyClassMergeRules(classMap []uint16, w, h int, geo [6]float64, proj string, rules []ClassMergeRule) {
 	if len(classMap) != w*h || w <= 0 || h <= 0 || len(rules) == 0 {
 		return
 	}
-	pixelSize := pixelSizeMetres(geo)
+	pixelSize := pixelSizeMetres(geo, w, h, proj)
 	for _, rule := range rules {
 		if rule.TargetClass < 0 || len(rule.SourceClasses) == 0 {
 			continue

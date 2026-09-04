@@ -36,11 +36,12 @@ type ModelSpec struct {
 	// (используется в removeSmallComponents до полигонизации).
 	MinArea float64 `json:"min_area,omitempty"`
 	// MinAreaM2 — минимальная площадь итогового полигона в КВАДРАТНЫХ МЕТРАХ
-	// (в СК снимка, МСК-59; используется при полигонизации). Ранее оба фильтра
-	// управлялись одним параметром min_area в РАЗНЫХ единицах. Если min_area_m2
-	// не задан, для обратной совместимости берётся значение min_area.
-	MinAreaM2 float64 `json:"min_area_m2,omitempty"`
-	Simplify  float64 `json:"simplify,omitempty"`
+	// Фильтр применяется ПОСЛЕ репроекции в целевую МСК-59, поэтому корректен
+	// для исходных GeoTIFF в WGS84, МСК-59, UTM и других CRS. Если min_area_m2
+	// не задан, для обратной совместимости берётся значение min_area; явный 0 отключает фильтр.
+	MinAreaM2JSON *float64 `json:"min_area_m2,omitempty"`
+	MinAreaM2     float64  `json:"-"`
+	Simplify      float64  `json:"simplify,omitempty"`
 
 	// Normalization — способ нормализации снимка перед подачей в модель:
 	//   "minmax" (по умолчанию) — растяжка по глобальным min/max листа
@@ -171,9 +172,14 @@ func FinalizeSpec(m ModelSpec) ModelSpec {
 	if m.MinArea <= 0 {
 		m.MinArea = 10
 	}
-	// Обратная совместимость: если фильтр площади полигона в м² не задан,
-	// сохраняем прежнее поведение (использовалось значение min_area).
-	if m.MinAreaM2 <= 0 {
+	// Явный min_area_m2=0 отключает метрический фильтр. Если поле отсутствует,
+	// для обратной совместимости используется min_area.
+	if m.MinAreaM2JSON != nil {
+		m.MinAreaM2 = *m.MinAreaM2JSON
+		if m.MinAreaM2 < 0 {
+			m.MinAreaM2 = 0
+		}
+	} else {
 		m.MinAreaM2 = m.MinArea
 	}
 	switch strings.ToLower(strings.TrimSpace(m.Normalization)) {

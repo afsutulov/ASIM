@@ -639,7 +639,7 @@ sendLoop:
 	// поэтому он появляется в поиске зданий и одновременно исчезает из поиска
 	// сооружений при одинаковом class_merge_rules в обеих логических моделях.
 	if classMergeRulesRelevant(spec.ClassMergeRules, spec.DetectionClasses) {
-		applyClassMergeRules(classMap, img.W, img.H, img.Geo, spec.ClassMergeRules)
+		applyClassMergeRules(classMap, img.W, img.H, img.Geo, img.Proj, spec.ClassMergeRules)
 	}
 
 	// Из единой карты классов извлекаются только классы, запрошенные текущей

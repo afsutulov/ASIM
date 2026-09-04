@@ -33,6 +33,8 @@ func initORTWithConfig(cfg *AppConfig) error {
 type ORTSession struct {
 	sess        *ort.DynamicAdvancedSession
 	device      string
+	deviceID    int
+	modelPath   string
 	inputName   string
 	outputNames []string
 	// Формы выходов, прочитанные из метаданных ONNX-модели при открытии
@@ -51,46 +53,115 @@ func NewORTSessionWithOutputs(cfg *AppConfig, modelPath string, inputName string
 	if err := initORTWithConfig(cfg); err != nil {
 		return nil, fmt.Errorf("onnxruntime init: %w", err)
 	}
-	opts, err := ort.NewSessionOptions()
-	if err != nil {
-		return nil, err
+	if len(outputNames) == 0 {
+		return nil, fmt.Errorf("no output names configured")
 	}
-	defer opts.Destroy()
-	_ = opts.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableAll)
 
 	device := strings.ToLower(strings.TrimSpace(cfg.Compute.Device))
 	if device == "" {
 		device = "cuda"
 	}
-	if device == "cuda" {
-		cudaOpts, err := ort.NewCUDAProviderOptions()
-		if err != nil {
-			return nil, fmt.Errorf("create CUDA provider options: %w", err)
-		}
-		defer cudaOpts.Destroy()
-		if err := cudaOpts.Update(map[string]string{
-			"device_id": fmt.Sprintf("%d", cfg.Compute.DeviceID),
-		}); err != nil {
-			return nil, fmt.Errorf("update CUDA provider options: %w", err)
-		}
-		if err := opts.AppendExecutionProviderCUDA(cudaOpts); err != nil {
-			return nil, fmt.Errorf("append CUDA execution provider: %w", err)
-		}
-		log.Printf("onnxruntime session configured for CUDA: device_id=%d model=%s", cfg.Compute.DeviceID, modelPath)
-	} else {
-		log.Printf("onnxruntime session configured for CPU: model=%s", modelPath)
-	}
 
-	if len(outputNames) == 0 {
-		return nil, fmt.Errorf("no output names configured")
+	sess := &ORTSession{
+		device:      device,
+		deviceID:    cfg.Compute.DeviceID,
+		modelPath:   modelPath,
+		inputName:   inputName,
+		outputNames: append([]string(nil), outputNames...),
 	}
-	s, err := ort.NewDynamicAdvancedSession(modelPath, []string{inputName}, outputNames, opts)
-	if err != nil {
+	if err := sess.open(); err != nil {
 		return nil, err
 	}
-	sess := &ORTSession{sess: s, device: device, inputName: inputName, outputNames: append([]string(nil), outputNames...)}
 	sess.detShape, sess.protoShape = readYOLOSegOutputShapes(modelPath, outputNames)
 	return sess, nil
+}
+
+const defaultORTGPUMemoryLimitBytes = "12884901888" // 12 GiB; leaves headroom on 15 GiB Tesla T4
+
+func ortGPUMemoryLimitBytes() string {
+	v := strings.TrimSpace(os.Getenv("ASIM_ORT_GPU_MEM_LIMIT_BYTES"))
+	if v == "" {
+		return defaultORTGPUMemoryLimitBytes
+	}
+	return v
+}
+
+func (s *ORTSession) open() error {
+	opts, err := ort.NewSessionOptions()
+	if err != nil {
+		return err
+	}
+	defer opts.Destroy()
+	_ = opts.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableAll)
+
+	if s.device == "cuda" {
+		cudaOpts, err := ort.NewCUDAProviderOptions()
+		if err != nil {
+			return fmt.Errorf("create CUDA provider options: %w", err)
+		}
+		defer cudaOpts.Destroy()
+
+		providerOptions := map[string]string{
+			"device_id":                    fmt.Sprintf("%d", s.deviceID),
+			"gpu_mem_limit":                ortGPUMemoryLimitBytes(),
+			"arena_extend_strategy":        "kSameAsRequested",
+			"cudnn_conv_use_max_workspace": "0",
+			"do_copy_in_default_stream":    "1",
+		}
+		if err := cudaOpts.Update(providerOptions); err != nil {
+			return fmt.Errorf("update CUDA provider options: %w", err)
+		}
+		if err := opts.AppendExecutionProviderCUDA(cudaOpts); err != nil {
+			return fmt.Errorf("append CUDA execution provider: %w", err)
+		}
+		log.Printf(
+			"onnxruntime session configured for CUDA: device_id=%d gpu_mem_limit=%s arena_extend_strategy=kSameAsRequested cudnn_conv_use_max_workspace=0 model=%s",
+			s.deviceID, providerOptions["gpu_mem_limit"], s.modelPath,
+		)
+	} else {
+		log.Printf("onnxruntime session configured for CPU: model=%s", s.modelPath)
+	}
+
+	newSess, err := ort.NewDynamicAdvancedSession(s.modelPath, []string{s.inputName}, s.outputNames, opts)
+	if err != nil {
+		return err
+	}
+	s.sess = newSess
+	return nil
+}
+
+func isCUDAAllocationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	markers := []string{
+		"cublas_status_alloc_failed",
+		"cudaerror_memoryallocation",
+		"cuda error 2",
+		"out of memory",
+		"failed to allocate memory",
+	}
+	for _, marker := range markers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *ORTSession) resetAfterCUDAAllocationFailure() error {
+	if s.device != "cuda" {
+		return fmt.Errorf("session reset requested for non-CUDA device %q", s.device)
+	}
+	if s.sess != nil {
+		if err := s.sess.Destroy(); err != nil {
+			log.Printf("onnxruntime CUDA session destroy before retry: device_id=%d error=%v", s.deviceID, err)
+		}
+		s.sess = nil
+	}
+	log.Printf("onnxruntime CUDA allocation failure: recreating session once: device_id=%d model=%s", s.deviceID, s.modelPath)
+	return s.open()
 }
 
 // readYOLOSegOutputShapes читает формы выходов YOLO-seg модели из метаданных
@@ -174,6 +245,25 @@ func yoloDetectionCount(tile int) int64 {
 }
 
 func (s *ORTSession) PredictYOLOSeg(input []float32, channels, height, width, numClasses, maskDim, protoStride int) ([]float32, []float32, int, int, int, error) {
+	det, proto, detCount, protoH, protoW, err := s.predictYOLOSegOnce(input, channels, height, width, numClasses, maskDim, protoStride)
+	if err == nil || !isCUDAAllocationError(err) {
+		return det, proto, detCount, protoH, protoW, err
+	}
+
+	log.Printf("onnxruntime CUDA allocation failure during inference; retrying current patch once after session reset: device_id=%d error=%v", s.deviceID, err)
+	if resetErr := s.resetAfterCUDAAllocationFailure(); resetErr != nil {
+		return nil, nil, 0, 0, 0, fmt.Errorf("CUDA allocation failure (%v); session reset failed: %w", err, resetErr)
+	}
+
+	det, proto, detCount, protoH, protoW, retryErr := s.predictYOLOSegOnce(input, channels, height, width, numClasses, maskDim, protoStride)
+	if retryErr != nil {
+		return nil, nil, 0, 0, 0, fmt.Errorf("CUDA inference failed after one session-reset retry: %w", retryErr)
+	}
+	log.Printf("onnxruntime CUDA inference recovered after session reset: device_id=%d", s.deviceID)
+	return det, proto, detCount, protoH, protoW, nil
+}
+
+func (s *ORTSession) predictYOLOSegOnce(input []float32, channels, height, width, numClasses, maskDim, protoStride int) ([]float32, []float32, int, int, int, error) {
 	if len(s.outputNames) < 2 {
 		return nil, nil, 0, 0, 0, fmt.Errorf("YOLO-seg ONNX session requires two outputs, got %d", len(s.outputNames))
 	}

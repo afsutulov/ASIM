@@ -670,6 +670,75 @@ func AppendShapefileFeaturesClipped(srcShp string, allowedGeom Geometry, dstShp 
 	return nil
 }
 
+func ConvertShapefileToGeoJSONMSK59(srcShp string, outGeoJSON string, zone int) error {
+	initGeom()
+	srcCP := C.CString(srcShp)
+	defer C.free(unsafe.Pointer(srcCP))
+	srcDS := C.GDALOpenEx(srcCP, C.GDAL_OF_VECTOR, nil, nil, nil)
+	if srcDS == nil {
+		return fmt.Errorf("open source vector: %s", srcShp)
+	}
+	defer C.GDALClose(srcDS)
+	srcLayer := C.GDALDatasetGetLayer(srcDS, 0)
+	if srcLayer == nil {
+		return fmt.Errorf("source layer not found: %s", srcShp)
+	}
+	if err := CreateEmptyGeoJSON(outGeoJSON); err != nil {
+		return err
+	}
+	dstDS, dstLayer, err := openLayerForAppend(outGeoJSON)
+	if err != nil {
+		return err
+	}
+	defer C.GDALClose(dstDS)
+	dstDefn := C.OGR_L_GetLayerDefn(dstLayer)
+	fdDN := C.CString("DN")
+	defer C.free(unsafe.Pointer(fdDN))
+	srcDNIndex := C.OGR_FD_GetFieldIndex(C.OGR_L_GetLayerDefn(srcLayer), fdDN)
+	dstDNIndex := C.OGR_FD_GetFieldIndex(dstDefn, fdDN)
+	// Shapefile .prj теряет BOUNDCRS/Helmert-параметры МСК-59. Для WGS84
+	// экспорта восстанавливаем полное определение выбранной зоны.
+	srcSRS, err := NewMSK59SRS(zone)
+	if err != nil {
+		return err
+	}
+	defer C.OSRDestroySpatialReference(srcSRS)
+	C.OGR_L_ResetReading(srcLayer)
+	for {
+		feat := C.OGR_L_GetNextFeature(srcLayer)
+		if feat == nil {
+			break
+		}
+		geom := C.OGR_F_GetGeometryRef(feat)
+		if geom == nil {
+			C.OGR_F_Destroy(feat)
+			continue
+		}
+		wg, err := reprojectGeometryToWGS84(geom, srcSRS)
+		if err != nil || wg == nil || GeometryIsEmpty(wg) {
+			if wg != nil {
+				DestroyGeometry(wg)
+			}
+			C.OGR_F_Destroy(feat)
+			continue
+		}
+		outFeat := C.OGR_F_Create(dstDefn)
+		if outFeat != nil {
+			if C.OGR_F_SetGeometry(outFeat, wg) == 0 {
+				if srcDNIndex >= 0 && dstDNIndex >= 0 {
+					C.OGR_F_SetFieldInteger(outFeat, dstDNIndex, C.OGR_F_GetFieldAsInteger(feat, srcDNIndex))
+				}
+				C.OGR_L_CreateFeature(dstLayer, outFeat)
+			}
+			C.OGR_F_Destroy(outFeat)
+		}
+		DestroyGeometry(wg)
+		C.OGR_F_Destroy(feat)
+	}
+	C.GDALFlushCache(dstDS)
+	return nil
+}
+
 func ConvertShapefileToGeoJSON(srcShp string, outGeoJSON string) error {
 	initGeom()
 	srcCP := C.CString(srcShp)
