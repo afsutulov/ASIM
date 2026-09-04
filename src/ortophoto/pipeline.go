@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -23,38 +23,53 @@ type ProcessConfig struct {
 	OutputName    string
 }
 
+// ImageStat описывает обработку одного листа ортофото в result.json.
+// Оставлены только поля, которые реально заполняются YOLO-конвейером;
+// прежний набор (interior_max/mean, boundary_*, adaptive_threshold и т.д.)
+// достался от UNet-конвейера sentinel-модуля и в result.json всегда
+// содержал нули, вводя в заблуждение при отладке.
 type ImageStat struct {
-	File                  string        `json:"file"`
-	Polygons              int           `json:"polygons"`
-	Duration              time.Duration `json:"duration"`
-	AvgPerImage           time.Duration `json:"avg_per_image"`
-	Skipped               bool          `json:"skipped"`
-	SkipReason            string        `json:"skip_reason,omitempty"`
-	InteriorMax           float32       `json:"interior_max"`
-	InteriorMean          float32       `json:"interior_mean"`
-	BoundaryMax           float32       `json:"boundary_max"`
-	BoundaryMean          float32       `json:"boundary_mean"`
-	InteriorPixels        int           `json:"interior_pixels"`
-	BoundaryPixels        int           `json:"boundary_pixels"`
-	PixelsAfterSubtract   int           `json:"pixels_after_subtract"`
-	PixelsAfterMorphology int           `json:"pixels_after_morphology"`
-	PixelsAfterAreaFilter int           `json:"pixels_after_area_filter"`
-	BoundaryDisabled      bool          `json:"boundary_disabled"`
-	AdaptiveThreshold     float32       `json:"adaptive_threshold"`
+	File           string        `json:"file"`
+	Polygons       int           `json:"polygons"`
+	Duration       time.Duration `json:"duration"`
+	AvgPerImage    time.Duration `json:"avg_per_image"`
+	Skipped        bool          `json:"skipped"`
+	SkipReason     string        `json:"skip_reason,omitempty"`
+	DetectedPixels int           `json:"detected_pixels"`
+	FinalPixels    int           `json:"final_pixels"`
 }
 
 type MaskDebugStats struct {
-	InteriorMax           float32
-	InteriorMean          float32
-	BoundaryMax           float32
-	BoundaryMean          float32
-	InteriorPixels        int
-	BoundaryPixels        int
-	PixelsAfterSubtract   int
-	PixelsAfterMorphology int
-	PixelsAfterAreaFilter int
-	BoundaryDisabled      bool
-	AdaptiveThreshold     float32
+	// DetectedPixels — пиксели, записанные в маску candidate-масками YOLO
+	// (до морфологии и фильтра площади).
+	DetectedPixels int
+	// FinalPixels — пиксели маски после морфологии, заливки дыр и фильтра
+	// малых компонент (то, что уходит в полигонизацию).
+	FinalPixels int
+	// Candidates — диагностические записи по кандидатам (только при
+	// spec.DumpCandidates).
+	Candidates []candidateRecord
+}
+
+// writeCandidateCSV пишет диагностику кандидатов одного листа: координаты
+// центра бокса в пикселях листа и в СК листа (через geotransform), сырые
+// размеры бокса, score, класс, заполнение бокса маской и решение фильтров.
+func writeCandidateCSV(path string, recs []candidateRecord, geo [6]float64) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	defer w.Flush()
+	fmt.Fprintln(w, "patch_x,patch_y,cx_px,cy_px,geo_x,geo_y,raw_w,raw_h,score,class,fill,decision")
+	for _, r := range recs {
+		gx := geo[0] + r.cxPx*geo[1] + r.cyPx*geo[2]
+		gy := geo[3] + r.cxPx*geo[4] + r.cyPx*geo[5]
+		fmt.Fprintf(w, "%d,%d,%.1f,%.1f,%.3f,%.3f,%.1f,%.1f,%.4f,%d,%.4f,%s\n",
+			r.patchX, r.patchY, r.cxPx, r.cyPx, gx, gy, r.rawW, r.rawH, r.score, r.classID, r.fill, r.decision)
+	}
+	return nil
 }
 
 func countMaskPixels(mask []uint8) int {
@@ -65,21 +80,6 @@ func countMaskPixels(mask []uint8) int {
 		}
 	}
 	return n
-}
-
-func probStats(prob []float32) (float32, float32) {
-	if len(prob) == 0 {
-		return 0, 0
-	}
-	maxv := prob[0]
-	sum := float64(0)
-	for _, v := range prob {
-		if v > maxv {
-			maxv = v
-		}
-		sum += float64(v)
-	}
-	return maxv, float32(sum / float64(len(prob)))
 }
 
 type ProcessStats struct {
@@ -103,14 +103,19 @@ func listOrthophotoFiles(root string, startYear, endYear int) ([]string, error) 
 		log.Printf("ortophoto scanning year directory: year=%d path=%s", year, yearDir)
 		err := filepath.WalkDir(yearDir, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
+				log.Printf("ortophoto scan entry failed: path=%s error=%v", path, err)
 				return err
 			}
 			if d.IsDir() {
 				return nil
 			}
-			lower := strings.ToLower(d.Name())
+			// TrimSpace makes collection tolerant of accidental trailing spaces in
+			// a filename after the extension. Log every discovered raster with its
+			// full path so an allegedly missing leaf can be verified unambiguously.
+			lower := strings.ToLower(strings.TrimSpace(d.Name()))
 			if strings.HasSuffix(lower, ".tif") || strings.HasSuffix(lower, ".tiff") {
 				files = append(files, path)
+				log.Printf("ortophoto file discovered: path=%s", path)
 			}
 			return nil
 		})
@@ -125,17 +130,49 @@ func listOrthophotoFiles(root string, startYear, endYear int) ([]string, error) 
 
 type patchInfo struct{ x, y int }
 
-func collectPatches(img *OrthoImage, tile, step int) []patchInfo {
-	patches := make([]patchInfo, 0)
-	for y := 0; y < img.H; y += step {
-		for x := 0; x < img.W; x += step {
-			patches = append(patches, patchInfo{x: x, y: y})
-			if x+tile >= img.W {
-				break
+// axisOffsets возвращает смещения тайлов вдоль одной оси растра.
+//
+// ВАЖНО (исправление пропуска сегментов зданий): последний тайл в ряду/столбце
+// теперь ПРИЖИМАЕТСЯ к правому/нижнему краю растра (offset = size - tile),
+// а не начинается на очередном шаге сетки и не свисает за край снимка.
+//
+// Раньше последний тайл выходил за границу растра, и недостающая часть
+// заполнялась в extractPatch искусственным фоном (нулями). Модель YOLO11-seg
+// обучалась на тайлах, целиком вырезанных из снимка, поэтому на таких
+// «полупустых» тайлах систематически теряла объекты. При этом полоса растра
+// шириной до step пикселей у правого/нижнего края покрывается ТОЛЬКО этим
+// последним тайлом — в результате у зданий, попадающих в эту полосу
+// (в т.ч. зданий на стыке соседних листов ортофото), пропадали целые
+// прямоугольные сегменты с идеально ровными границами по линиям сетки тайлов.
+//
+// Теперь каждый тайл целиком лежит внутри растра (если растр не меньше тайла),
+// модель всегда получает полностью «настоящие» пиксели, а перекрытие соседних
+// тайлов у края лишь увеличивается, что безопасно: маски объединяются по OR.
+func axisOffsets(size, tile, step int) []int {
+	if size <= tile {
+		return []int{0}
+	}
+	offsets := make([]int, 0, size/step+2)
+	for v := 0; ; v += step {
+		if v+tile >= size {
+			last := size - tile
+			if len(offsets) == 0 || offsets[len(offsets)-1] != last {
+				offsets = append(offsets, last)
 			}
-		}
-		if y+tile >= img.H {
 			break
+		}
+		offsets = append(offsets, v)
+	}
+	return offsets
+}
+
+func collectPatches(img *OrthoImage, tile, step int) []patchInfo {
+	xs := axisOffsets(img.W, tile, step)
+	ys := axisOffsets(img.H, tile, step)
+	patches := make([]patchInfo, 0, len(xs)*len(ys))
+	for _, y := range ys {
+		for _, x := range xs {
+			patches = append(patches, patchInfo{x: x, y: y})
 		}
 	}
 	return patches
@@ -144,6 +181,14 @@ func collectPatches(img *OrthoImage, tile, step int) []patchInfo {
 func extractPatch(img *OrthoImage, x, y, tile int) ([]float32, []uint8) {
 	data := make([]float32, img.C*tile*tile)
 	valid := make([]uint8, tile*tile)
+	// Область за пределами растра заполняем белым (1.0) — той же «краской»,
+	// которой ReadOrthophoto помечает nodata-пиксели. Раньше заполнение было
+	// нулями (чёрным): такой фон модель не видела при обучении, что снижало
+	// качество детекции на краевых тайлах. После исправления axisOffsets
+	// заполнение вообще требуется только когда растр меньше тайла.
+	for i := range data {
+		data[i] = 1
+	}
 	for c := 0; c < img.C; c++ {
 		srcOff := c * img.W * img.H
 		dstOff := c * tile * tile
@@ -166,332 +211,17 @@ func extractPatch(img *OrthoImage, x, y, tile int) ([]float32, []uint8) {
 }
 
 func runModelOnImage(img *OrthoImage, sessions []*ORTSession, spec ModelSpec) ([]uint8, int, MaskDebugStats, error) {
-	tile := spec.Tile
-	if tile <= 0 {
-		tile = 512
-	}
-	bound := spec.Bound
-	if bound < 0 {
-		bound = 0
-	}
-	step := tile - 2*bound
-	if step <= 0 {
-		step = tile
-	}
-	patches := collectPatches(img, tile, step)
-
-	interiorSum := make([]float32, img.W*img.H)
-	boundarySum := make([]float32, img.W*img.H)
-	counts := make([]float32, img.W*img.H)
-
-	batchSize := spec.BatchSize
-	if batchSize <= 0 {
-		batchSize = 4
-	}
-	if len(sessions) == 0 {
-		return nil, 0, MaskDebugStats{}, fmt.Errorf("no ONNX sessions configured")
-	}
-
-	type batchTask struct {
-		id      int
-		patches []patchInfo
-		input   []float32
-	}
-	type batchResult struct {
-		task     batchTask
-		pred     []float32
-		err      error
-		workerID int
-	}
-
-	jobs := make(chan batchTask, len(sessions)*4)
-	results := make(chan batchResult, len(sessions)*4)
-
-	var wg sync.WaitGroup
-	for workerID, session := range sessions {
-		wg.Add(1)
-		go func(id int, sess *ORTSession) {
-			defer wg.Done()
-			processed := 0
-			for task := range jobs {
-				pred, err := sess.Predict(task.input, len(task.patches), img.C, tile, tile, 2)
-				processed++
-				results <- batchResult{task: task, pred: pred, err: err, workerID: id}
-			}
-		}(workerID, session)
-	}
-
-	submittedCh := make(chan int, 1)
-	go func() {
-		defer close(jobs)
-		submitted := 0
-		batchPatches := make([]patchInfo, 0, batchSize)
-		batchInput := make([]float32, 0, batchSize*img.C*tile*tile)
-
-		flush := func() {
-			if len(batchPatches) == 0 {
-				return
-			}
-			inputCopy := make([]float32, len(batchInput))
-			copy(inputCopy, batchInput)
-			patchCopy := make([]patchInfo, len(batchPatches))
-			copy(patchCopy, batchPatches)
-			jobs <- batchTask{id: submitted, patches: patchCopy, input: inputCopy}
-			submitted++
-			batchPatches = batchPatches[:0]
-			batchInput = batchInput[:0]
-		}
-
-		for _, p := range patches {
-			patch, valid := extractPatch(img, p.x, p.y, tile)
-			if isMostlyEmptyTile(
-				patch, valid, img.C, tile, tile,
-				float32(spec.EmptyTileValue),
-				spec.EmptyTileWhiteRatio,
-				spec.EmptyTileValidRatio,
-			) {
-				continue
-			}
-			batchPatches = append(batchPatches, p)
-			batchInput = append(batchInput, patch...)
-			if len(batchPatches) >= batchSize {
-				flush()
-			}
-		}
-		flush()
-		submittedCh <- submitted
-	}()
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	submitted := -1
-	modelRuns := 0
-	workerBatches := make(map[int]int)
-
-	for {
-		if submitted < 0 {
-			select {
-			case submitted = <-submittedCh:
-				if submitted == 0 {
-					break
-				}
-			case res, ok := <-results:
-				if !ok {
-					submitted = 0
-					break
-				}
-				if res.err != nil {
-					return nil, modelRuns, MaskDebugStats{}, res.err
-				}
-				modelRuns++
-				workerBatches[res.workerID]++
-				for bi, p := range res.task.patches {
-					baseInt := bi * 2 * tile * tile
-					baseBnd := baseInt + tile*tile
-					accumulatePatchPrediction(img, tile, bound, p, res.pred, baseInt, baseBnd, interiorSum, boundarySum, counts)
-				}
-			}
-		} else {
-			break
-		}
-	}
-
-	for res := range results {
-		if res.err != nil {
-			return nil, modelRuns, MaskDebugStats{}, res.err
-		}
-		modelRuns++
-		workerBatches[res.workerID]++
-		if modelRuns%50 == 0 {
-		}
-		for bi, p := range res.task.patches {
-			baseInt := bi * 2 * tile * tile
-			baseBnd := baseInt + tile*tile
-			accumulatePatchPrediction(img, tile, bound, p, res.pred, baseInt, baseBnd, interiorSum, boundarySum, counts)
-		}
-	}
-
-	interiorProb := make([]float32, img.W*img.H)
-	boundaryProb := make([]float32, img.W*img.H)
-	for i := 0; i < len(interiorProb); i++ {
-		if counts[i] == 0 {
-			continue
-		}
-		interiorProb[i] = interiorSum[i] / counts[i]
-		boundaryProb[i] = boundarySum[i] / counts[i]
-	}
-
-	debug := MaskDebugStats{}
-	debug.InteriorMax, debug.InteriorMean = probStats(interiorProb)
-	debug.BoundaryMax, debug.BoundaryMean = probStats(boundaryProb)
-
-	thr := spec.Threshold
-	if thr <= 0 {
-		thr = 0.5
-	}
-	interiorMask := thresholdMask(interiorProb, thr)
-	debug.InteriorPixels = countMaskPixels(interiorMask)
-
-	if debug.InteriorPixels == 0 && debug.InteriorMax > 0.05 {
-		adaptive := debug.InteriorMax * 0.50
-		if adaptive < 0.05 {
-			adaptive = 0.05
-		}
-		if adaptive > thr {
-			adaptive = thr
-		}
-		interiorMask = thresholdMask(interiorProb, adaptive)
-		debug.InteriorPixels = countMaskPixels(interiorMask)
-		debug.AdaptiveThreshold = adaptive
-	}
-
-	bthr := spec.BoundaryThreshold
-	if bthr <= 0 {
-		bthr = 0.35
-	}
-	boundaryMask := thresholdMask(boundaryProb, bthr)
-	debug.BoundaryPixels = countMaskPixels(boundaryMask)
-
-	mask := interiorMask
-	if spec.BoundaryAware && debug.InteriorPixels > 0 {
-		candidateBoundary := boundaryMask
-		if debug.BoundaryPixels > 0 {
-			candidateBoundary = dilateMask(candidateBoundary, img.W, img.H, 1)
-		}
-		candidate := andNotMask(interiorMask, candidateBoundary, img.ValidMask)
-		candidatePixels := countMaskPixels(candidate)
-		debug.PixelsAfterSubtract = candidatePixels
-
-		if candidatePixels >= max(1, debug.InteriorPixels/20) {
-			mask = candidate
-		} else {
-			debug.BoundaryDisabled = true
-			mask = interiorMask
-		}
-	} else {
-		debug.PixelsAfterSubtract = debug.InteriorPixels
-	}
-	applyValidMask(mask, img.ValidMask)
-
-	beforeMorph := countMaskPixels(mask)
-	if spec.MorphOpen > 0 {
-		candidate := openMask(mask, img.W, img.H, spec.MorphOpen)
-		if countMaskPixels(candidate) > 0 || beforeMorph == 0 {
-			mask = candidate
-		}
-	}
-	if spec.MorphClose > 0 {
-		candidate := closeMask(mask, img.W, img.H, spec.MorphClose)
-		if countMaskPixels(candidate) > 0 || countMaskPixels(mask) == 0 {
-			mask = candidate
-		}
-	}
-	debug.PixelsAfterMorphology = countMaskPixels(mask)
-
-	beforeArea := countMaskPixels(mask)
-	candidate := removeSmallComponents(mask, img.W, img.H, int(spec.MinArea))
-	if countMaskPixels(candidate) > 0 || beforeArea == 0 {
-		mask = candidate
-	}
-	applyValidMask(mask, img.ValidMask)
-	debug.PixelsAfterAreaFilter = countMaskPixels(mask)
-
-	outputMask := makeBoundaryOutputMask(mask, boundaryMask, img.W, img.H, spec)
-	applyValidMask(outputMask, img.ValidMask)
-	return outputMask, modelRuns, debug, nil
-}
-
-func accumulatePatchPrediction(
-	img *OrthoImage,
-	tile int,
-	bound int,
-	p patchInfo,
-	pred []float32,
-	baseInt int,
-	baseBnd int,
-	interiorSum []float32,
-	boundarySum []float32,
-	counts []float32,
-) {
-	y0, y1 := 0, tile
-	x0, x1 := 0, tile
-	if p.y > 0 {
-		y0 = bound
-	}
-	if p.x > 0 {
-		x0 = bound
-	}
-	if p.y+tile < img.H {
-		y1 = tile - bound
-	}
-	if p.x+tile < img.W {
-		x1 = tile - bound
-	}
-
-	for yy := y0; yy < y1; yy++ {
-		sy := p.y + yy
-		if sy >= img.H {
-			continue
-		}
-		for xx := x0; xx < x1; xx++ {
-			sx := p.x + xx
-			if sx >= img.W {
-				continue
-			}
-			idx := sy*img.W + sx
-			if img.ValidMask[idx] == 0 {
-				continue
-			}
-			interiorSum[idx] += sigmoid(pred[baseInt+yy*tile+xx])
-			boundarySum[idx] += sigmoid(pred[baseBnd+yy*tile+xx])
-			counts[idx] += 1
-		}
-	}
-}
-
-func makeBoundaryOutputMask(interiorMask []uint8, boundaryMask []uint8, w, h int, spec ModelSpec) []uint8 {
-	mode := strings.ToLower(strings.TrimSpace(spec.ResultMode))
-
-	// polygon / contour / parcels:
-	// Возвращаем маску участков как площади. Polygonize по этой маске создаёт
-	// замкнутые контуры отдельных участков. В интерфейсе такие polygon-геометрии
-	// нужно рисовать без заливки, только outline.
-	if mode == "" || mode == "polygon" || mode == "polygons" || mode == "contour" || mode == "contours" || mode == "parcel" || mode == "parcels" {
-		out := make([]uint8, len(interiorMask))
-		copy(out, interiorMask)
-		return out
-	}
-
-	// boundary / lines:
-	// Это диагностический режим. Он выводит тонкую boundary-маску, но такая
-	// маска может быть разорванной и не является полноценным контуром участка.
-	if mode == "boundary" || mode == "boundaries" || mode == "line" || mode == "lines" {
-		if countMaskPixels(boundaryMask) > 0 {
-			out := dilateMask(boundaryMask, w, h, 1)
-			if countMaskPixels(out) > 0 {
-				return out
-			}
-		}
-		eroded := erodeMask(interiorMask, w, h, 1)
-		out := make([]uint8, len(interiorMask))
-		for i := range interiorMask {
-			if interiorMask[i] != 0 && eroded[i] == 0 {
-				out[i] = 1
-			}
-		}
-		out = dilateMask(out, w, h, 1)
-		return out
-	}
-
-	out := make([]uint8, len(interiorMask))
-	copy(out, interiorMask)
-	return out
+	return runYOLOSegOnImage(img, sessions, spec)
 }
 
 func zipDir(srcDir, zipPath string) error {
+	return zipDirExcluding(srcDir, zipPath, "")
+}
+
+// zipDirExcluding архивирует srcDir в zipPath, пропуская файл excludePath
+// (если он не пустой). Используется чтобы не класть в итоговый архив
+// технический result.json, который нужен только для отладки.
+func zipDirExcluding(srcDir, zipPath, excludePath string) error {
 	zf, err := os.Create(zipPath)
 	if err != nil {
 		return err
@@ -504,6 +234,9 @@ func zipDir(srcDir, zipPath string) error {
 			return err
 		}
 		if info.IsDir() {
+			return nil
+		}
+		if excludePath != "" && path == excludePath {
 			return nil
 		}
 		rel, err := filepath.Rel(srcDir, path)
@@ -531,32 +264,26 @@ func zipDir(srcDir, zipPath string) error {
 	})
 }
 
-func countShapefileFeatures(shpPath string) (int, error) {
-	g, err := LoadUnionGeometryFromVector(shpPath)
-	if err != nil {
-		return 0, err
-	}
-	defer DestroyGeometry(g)
-	// Быстрый и грубый счёт по одному union geometry нам не подходит,
-	// поэтому считаем через GDAL-открытие в отдельной функции ниже.
-	return countVectorFeatures(shpPath)
-}
-
 func openORTSessions(app *AppConfig, spec ModelSpec, modelPath string) ([]*ORTSession, error) {
-	deviceIDs := append([]int(nil), app.ORTDeviceIDs...)
+	deviceIDs := append([]int(nil), app.Compute.GPUs...)
 	if len(deviceIDs) == 0 {
-		deviceIDs = []int{app.ORTDeviceID}
+		deviceIDs = []int{app.Compute.DeviceID}
 	}
 	if len(deviceIDs) == 0 {
 		deviceIDs = []int{0}
 	}
-	log.Printf("ortophoto opening model sessions: model=%s path=%s input=%s output=%s device=%s gpus=%v", spec.Name, modelPath, spec.InputName, spec.OutputName, app.ORTDevice, deviceIDs)
+	outputNames := append([]string(nil), spec.OutputNames...)
+	if len(outputNames) == 0 {
+		outputNames = []string{"output0", "output1"}
+	}
+	log.Printf("ortophoto opening model sessions: model=%s path=%s input=%s outputs=%v device=%s gpus=%v", spec.Name, modelPath, spec.InputName, outputNames, app.Compute.Device, deviceIDs)
 
 	sessions := make([]*ORTSession, 0, len(deviceIDs))
 	for _, gpuID := range deviceIDs {
 		localCfg := *app
-		localCfg.ORTDeviceID = gpuID
-		sess, err := NewORTSession(&localCfg, modelPath, spec.InputName, spec.OutputName)
+		localCfg.Compute.DeviceID = gpuID
+		localCfg.Compute.GPUs = []int{gpuID}
+		sess, err := NewORTSessionWithOutputs(&localCfg, modelPath, spec.InputName, outputNames)
 		if err != nil {
 			closeORTSessions(sessions)
 			return nil, err
@@ -600,7 +327,7 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 	defer os.RemoveAll(workDir)
 
 	modelPath := cfg.App.ModelPath(cfg.Spec)
-	log.Printf("ortophoto model configured: model=%s path=%s input=%s output=%s device=%s gpus=%v", cfg.Spec.Name, modelPath, cfg.Spec.InputName, cfg.Spec.OutputName, cfg.App.ORTDevice, cfg.App.ORTDeviceIDs)
+	log.Printf("ortophoto YOLO11 model configured: model=%s path=%s input=%s outputs=%v device=%s gpus=%v", cfg.Spec.Name, modelPath, cfg.Spec.InputName, cfg.Spec.OutputNames, cfg.App.Compute.Device, cfg.App.Compute.GPUs)
 	sessions, err := openORTSessions(cfg.App, cfg.Spec, modelPath)
 	if err != nil {
 		return "", stats, err
@@ -611,18 +338,43 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 	if err := os.MkdirAll(shpDir, 0o755); err != nil {
 		return "", stats, err
 	}
-	geojsonPath := filepath.Join(workDir, safeName(cfg.Spec.Name)+".geojson")
-	if err := CreateEmptyGeoJSON(geojsonPath); err != nil {
-		return "", stats, err
-	}
+	// Накопительный shapefile хранит результат в исходной проекции снимков (МСК-59,
+	// зона определяется по первому обработанному снимку). Никакого прохода через
+	// WGS84 здесь нет: это важно, поскольку результат впоследствии сверяется
+	// с кадастровыми данными и требует точной координатной привязки.
+	resultShp := filepath.Join(shpDir, safeName(cfg.Spec.Name)+".shp")
+	accumulatorReady := false
 
 	processedDurSum := time.Duration(0)
 	for _, tif := range files {
 		imgStart := time.Now()
 		imgStat := ImageStat{File: tif}
-		log.Printf("ortophoto image start: file=%s", filepath.Base(tif))
+		log.Printf("ortophoto image start: file=%s path=%s", filepath.Base(tif), tif)
 
-		img, err := ReadOrthophoto(tif)
+		info, err := ReadOrthophotoInfo(tif)
+		if err != nil {
+			log.Printf("ortophoto metadata read failed: file=%s error=%v", tif, err)
+			imgStat.Skipped = true
+			imgStat.SkipReason = err.Error()
+			stats.Images = append(stats.Images, imgStat)
+			continue
+		}
+
+		intersects, err := RasterIntersectsAllowedWGS84(info.Geo, info.W, info.H, info.Proj, allowedGeom)
+		if err != nil {
+			log.Printf("ortophoto spatial prefilter failed, image will be processed: file=%s error=%v", tif, err)
+			intersects = true
+		}
+		if !intersects {
+			imgStat.Skipped = true
+			imgStat.SkipReason = "outside search polygon"
+			imgStat.Duration = time.Since(imgStart)
+			stats.Images = append(stats.Images, imgStat)
+			log.Printf("ortophoto image skipped by spatial prefilter: file=%s path=%s", filepath.Base(tif), tif)
+			continue
+		}
+
+		img, err := ReadOrthophoto(tif, cfg.Spec.Normalization)
 		if err != nil {
 			log.Printf("ortophoto read failed: file=%s error=%v", tif, err)
 			imgStat.Skipped = true
@@ -633,21 +385,20 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 
 		mask, runs, dbg, err := runModelOnImage(img, sessions, cfg.Spec)
 		stats.ModelRuns += runs
-		imgStat.InteriorMax = dbg.InteriorMax
-		imgStat.InteriorMean = dbg.InteriorMean
-		imgStat.BoundaryMax = dbg.BoundaryMax
-		imgStat.BoundaryMean = dbg.BoundaryMean
-		imgStat.InteriorPixels = dbg.InteriorPixels
-		imgStat.BoundaryPixels = dbg.BoundaryPixels
-		imgStat.PixelsAfterSubtract = dbg.PixelsAfterSubtract
-		imgStat.PixelsAfterMorphology = dbg.PixelsAfterMorphology
-		imgStat.PixelsAfterAreaFilter = dbg.PixelsAfterAreaFilter
-		imgStat.BoundaryDisabled = dbg.BoundaryDisabled
-		imgStat.AdaptiveThreshold = dbg.AdaptiveThreshold
+		imgStat.DetectedPixels = dbg.DetectedPixels
+		imgStat.FinalPixels = dbg.FinalPixels
 		if err != nil {
 			return "", stats, err
 		}
-		log.Printf("ortophoto inference: file=%s batches=%d int_pixels=%d bnd_pixels=%d out_pixels=%d", filepath.Base(tif), runs, dbg.InteriorPixels, dbg.BoundaryPixels, dbg.PixelsAfterAreaFilter)
+		if cfg.Spec.DumpCandidates {
+			csvPath := filepath.Join(workDir, safeName(filepath.Base(tif))+"_candidates.csv")
+			if cerr := writeCandidateCSV(csvPath, dbg.Candidates, img.Geo); cerr != nil {
+				log.Printf("ortophoto candidate dump failed: file=%s error=%v", tif, cerr)
+			} else {
+				log.Printf("ortophoto candidate dump: %s (%d candidates)", csvPath, len(dbg.Candidates))
+			}
+		}
+		log.Printf("ortophoto inference: file=%s tiles=%d detected_pixels=%d final_pixels=%d", filepath.Base(tif), runs, dbg.DetectedPixels, dbg.FinalPixels)
 
 		// Быстрый пропуск пустого результата
 		nonZero := 0
@@ -669,12 +420,15 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 		}
 
 		maskTif := filepath.Join(workDir, safeName(filepath.Base(tif))+"_mask.tif")
-		if err := WriteGeoTIFF1(maskTif, toFloatMask(mask), img.W, img.H, img.Geo, img.Proj); err != nil {
+		if err := WriteGeoTIFFMask(maskTif, mask, img.W, img.H, img.Geo, img.Proj); err != nil {
 			return "", stats, err
 		}
 
 		fileShp := filepath.Join(workDir, safeName(strings.TrimSuffix(filepath.Base(tif), filepath.Ext(tif)))+"_tmp.shp")
-		if err := PolygonizeMaskToShapefile(maskTif, fileShp, cfg.Spec.MinArea, cfg.Spec.Simplify); err != nil {
+		// MinAreaM2 — фильтр площади полигона в м² (СК снимка, МСК-59);
+		// НЕ путать с MinArea (пиксели), который применяется к компонентам
+		// маски в removeSmallComponents ещё до полигонизации.
+		if err := PolygonizeMaskToShapefile(maskTif, fileShp, cfg.Spec.MinAreaM2, cfg.Spec.Simplify); err != nil {
 			log.Printf("ortophoto polygonize failed: file=%s error=%v", tif, err)
 			imgStat.Skipped = true
 			imgStat.SkipReason = err.Error()
@@ -683,21 +437,36 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 		}
 
 		_ = os.Remove(maskTif)
-		_, unclippedErr := countShapefileFeatures(fileShp)
-		if unclippedErr != nil {
-			log.Printf("ortophoto unclipped feature count failed: file=%s error=%v", tif, unclippedErr)
-		}
 		clippedShp := filepath.Join(workDir, safeName(strings.TrimSuffix(filepath.Base(tif), filepath.Ext(tif)))+"_clip_tmp.shp")
-		if err := ClipShapefileToGeometry(fileShp, clippedShp, allowedGeom); err != nil {
+		// Передаём img.Proj — полный WKT проекции снимка (BOUNDCRS с датум-сдвигом
+		// Pulkovo1942->WGS84) напрямую, а не полагаемся на СК, перечитанную из
+		// .prj файла fileShp: при записи в ESRI Shapefile GDAL теряет параметры
+		// датум-трансформации, из-за чего сверка с шаблоном полигона поиска
+		// (хранится в WGS84) ломается и результат становится пустым.
+		if err := ClipShapefileToGeometryWithSRSWKT(fileShp, clippedShp, allowedGeom, img.Proj); err != nil {
 			return "", stats, err
 		}
-		polyCount, err := countShapefileFeatures(clippedShp)
+		polyCount, err := countVectorFeatures(clippedShp)
 		if err != nil {
 			return "", stats, err
 		}
 		log.Printf("ortophoto vectors: file=%s features=%d", filepath.Base(tif), polyCount)
 		if polyCount > 0 {
-			if err := AppendShapefileToGeoJSON(clippedShp, geojsonPath); err != nil {
+			if !accumulatorReady {
+				// Первая партия полигонов задаёт целевую СК результата — МСК-59
+				// нужной зоны, считанную напрямую из текущего снимка/clippedShp.
+				srs, err := ReadLayerSRS(clippedShp)
+				if err != nil {
+					return "", stats, fmt.Errorf("read clipped layer SRS: %w", err)
+				}
+				if err := CreateEmptyAccumulatorShapefile(resultShp, srs); err != nil {
+					DestroySRS(srs)
+					return "", stats, err
+				}
+				DestroySRS(srs)
+				accumulatorReady = true
+			}
+			if err := AppendShapefileToAccumulator(clippedShp, resultShp); err != nil {
 				return "", stats, err
 			}
 		}
@@ -720,8 +489,32 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 		stats.AvgPerImage = processedDurSum / time.Duration(stats.FilesProcessed)
 	}
 
-	resultShp := filepath.Join(shpDir, safeName(cfg.Spec.Name)+".shp")
-	if err := ExportGeoJSONToShapefile(geojsonPath, resultShp); err != nil {
+	if !accumulatorReady {
+		// Полигонов не найдено ни на одном снимке — создаём пустой shapefile
+		// в СК первого снимка набора данных, чтобы результат был валидным.
+		if len(files) > 0 {
+			// Достаточно метаданных: раньше здесь читался ВЕСЬ растр
+			// (гигабайты) только ради строки проекции.
+			probeInfo, err := ReadOrthophotoInfo(files[0])
+			if err == nil {
+				srs, srsErr := projSRSFromWKT(probeInfo.Proj)
+				if srsErr == nil {
+					_ = CreateEmptyAccumulatorShapefile(resultShp, srs)
+					DestroySRS(srs)
+				}
+			}
+		}
+		if _, err := os.Stat(resultShp); err != nil {
+			if err := CreateEmptyShapefile(resultShp); err != nil {
+				return "", stats, err
+			}
+		}
+	}
+
+	// Экспорт результата в GeoJSON в ТОЙ ЖЕ СК (МСК-59), без репроекции —
+	// итоговый архив должен содержать оба формата: Shp/ (shapefile) и geojson.
+	geojsonPath := filepath.Join(workDir, safeName(cfg.Spec.Name)+".geojson")
+	if err := ExportShapefileToGeoJSON(resultShp, geojsonPath); err != nil {
 		return "", stats, err
 	}
 
@@ -738,6 +531,9 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 		"avg_per_image":   stats.AvgPerImage.String(),
 		"images":          stats.Images,
 	}
+	// result.json пишем внутри workDir для удобства отладки (он будет удалён
+	// вместе с workDir по defer), но НЕ включаем его в итоговый zip-архив —
+	// в архиве должны быть только Shp/ и geojson.
 	manifestPath := filepath.Join(workDir, "result.json")
 	blob, _ := json.MarshalIndent(manifest, "", "  ")
 	if err := os.WriteFile(manifestPath, blob, 0o644); err != nil {
@@ -745,7 +541,7 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 	}
 
 	zipPath := filepath.Join(cfg.App.ResultsPath, safeName(cfg.OutputName)+".zip")
-	if err := zipDir(workDir, zipPath); err != nil {
+	if err := zipDirExcluding(workDir, zipPath, manifestPath); err != nil {
 		return "", stats, err
 	}
 	return zipPath, stats, nil

@@ -387,7 +387,7 @@ def enrich_rows(source: dict[str, Any], cfg: dict[str, Any], include_download: b
     return rows
 
 
-def tail_lines(path: Path, count: int = 500) -> str:
+def tail_lines(path: Path, count: int = 5000) -> str:
     if not path.exists():
         return f"Файл не найден: {path}"
     with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -548,7 +548,7 @@ def too_large(error: Any):
 def handle_exception(error: Exception):
     if isinstance(error, HTTPException):
         return error
-    log_request_failure(500, f"reason={type(error).__name__}:{str(error)}")
+    log_request_failure(5000, f"reason={type(error).__name__}:{str(error)}")
     if wants_json_response():
         return jsonify({"error": "Внутренняя ошибка сервера"}), 500
     return render_template("login.html", error="Внутренняя ошибка сервера"), 500
@@ -734,6 +734,7 @@ def create_processing():
             return jsonify({"error": "Выбранный год отсутствует в хранилище ортофото"}), 400
         entry = {
             "model": model_key,
+            "preprocess": preprocess_key,
             "poligon": poligon,
             "start": str(start_year),
             "end": str(end_year),
@@ -773,7 +774,7 @@ def create_processing():
             if is_two_input and (not start2 or not end2):
                 return jsonify({"error": "Для модели с двумя входами нужны start2 и end2"}), 400
 
-        entry = {"model": model_key, "poligon": poligon, "cloud": cloud, "start": start, "end": end, "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
+        entry = {"model": model_key, "preprocess": preprocess_key, "poligon": poligon, "cloud": cloud, "start": start, "end": end, "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
         if is_two_input:
             entry["start2"] = start2
             entry["end2"] = end2

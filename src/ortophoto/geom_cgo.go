@@ -109,6 +109,30 @@ func newEPSG4326SRS() C.OGRSpatialReferenceH {
 	return srs
 }
 
+// projSRSFromWKT строит OGRSpatialReferenceH из WKT-строки проекции растра
+// (например, img.Proj, считанной GDAL из geotiff). Используется в случаях,
+// когда нужно создать пустой накопительный shapefile в СК снимка (МСК-59
+// нужной зоны) без открытия векторного слоя.
+func projSRSFromWKT(wkt string) (C.OGRSpatialReferenceH, error) {
+	if strings.TrimSpace(wkt) == "" {
+		return nil, fmt.Errorf("empty projection WKT")
+	}
+	initGeom()
+	srs := C.OSRNewSpatialReference(nil)
+	if srs == nil {
+		return nil, fmt.Errorf("create spatial reference failed")
+	}
+	cwkt := C.CString(wkt)
+	defer C.free(unsafe.Pointer(cwkt))
+	pwkt := cwkt
+	if C.OSRImportFromWkt(srs, (**C.char)(unsafe.Pointer(&pwkt))) != 0 {
+		C.OSRDestroySpatialReference(srs)
+		return nil, fmt.Errorf("import projection WKT failed")
+	}
+	C._set_traditional_gis_order(srs)
+	return srs, nil
+}
+
 func loadUnionGeometryWithSRS(path string) (Geometry, C.OGRSpatialReferenceH, error) {
 	initGeom()
 	cp := C.CString(path)
@@ -382,6 +406,125 @@ func createEmptyVector(path string, driverName string) error {
 	return nil
 }
 
+func createEmptyVectorWithSRS(path string, driverName string, srs C.OGRSpatialReferenceH) error {
+	initGeom()
+	path = filepath.Clean(path)
+	base := filepath.Join(filepath.Dir(path), strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+	if driverName == "ESRI Shapefile" {
+		for _, ext := range []string{".shp", ".shx", ".dbf", ".prj", ".cpg"} {
+			_ = os.Remove(base + ext)
+		}
+	} else {
+		_ = os.Remove(path)
+	}
+	drvName := C.CString(driverName)
+	defer C.free(unsafe.Pointer(drvName))
+	drv := C.OGRGetDriverByName(drvName)
+	if drv == nil {
+		return fmt.Errorf("OGR driver not found: %s", driverName)
+	}
+	cp := C.CString(path)
+	defer C.free(unsafe.Pointer(cp))
+	ds := C.OGR_Dr_CreateDataSource(drv, cp, nil)
+	if ds == nil {
+		return fmt.Errorf("create vector: %s", path)
+	}
+	defer C.OGR_DS_Destroy(ds)
+	layerName := C.CString("result")
+	defer C.free(unsafe.Pointer(layerName))
+	var srsCopy C.OGRSpatialReferenceH
+	if srs != nil {
+		srsCopy = C.OSRClone(srs)
+		C._set_traditional_gis_order(srsCopy)
+		defer C.OSRDestroySpatialReference(srsCopy)
+	}
+	layer := C.OGR_DS_CreateLayer(ds, layerName, srsCopy, C.wkbMultiPolygon, nil)
+	if layer == nil {
+		return fmt.Errorf("create layer: %s", path)
+	}
+	fdName := C.CString("DN")
+	fd := C.OGR_Fld_Create(fdName, C.OFTInteger)
+	C.free(unsafe.Pointer(fdName))
+	if fd != nil {
+		C.OGR_L_CreateField(layer, fd, 1)
+		C.OGR_Fld_Destroy(fd)
+	}
+	C.OGR_DS_SyncToDisk(ds)
+	return nil
+}
+
+// ExportShapefileToGeoJSON копирует геометрии из shapefile (СК — МСК-59 нужной
+// зоны) в GeoJSON-файл В ТОЙ ЖЕ СК, без какой-либо репроекции в WGS84.
+// Это сознательное отступление от RFC7946 (GeoJSON формально требует WGS84):
+// итоговые координаты должны оставаться в МСК-59 для точного сопоставления
+// с кадастровыми данными, поэтому никаких преобразований СК здесь не выполняется.
+func ExportShapefileToGeoJSON(srcShp string, outGeoJSON string) error {
+	initGeom()
+	srcCP := C.CString(srcShp)
+	defer C.free(unsafe.Pointer(srcCP))
+	srcDS := C.GDALOpenEx(srcCP, C.GDAL_OF_VECTOR, nil, nil, nil)
+	if srcDS == nil {
+		return fmt.Errorf("open source vector: %s", srcShp)
+	}
+	defer C.GDALClose(srcDS)
+	srcLayer := C.GDALDatasetGetLayer(srcDS, 0)
+	if srcLayer == nil {
+		return fmt.Errorf("source layer not found: %s", srcShp)
+	}
+
+	srcSRS := C.OGR_L_GetSpatialRef(srcLayer)
+	if err := createEmptyVectorWithSRS(outGeoJSON, "GeoJSON", srcSRS); err != nil {
+		return err
+	}
+	dstDS, dstLayer, err := openLayerForAppend(outGeoJSON)
+	if err != nil {
+		return err
+	}
+	defer C.GDALClose(dstDS)
+	dstDefn := C.OGR_L_GetLayerDefn(dstLayer)
+	fdDN := C.CString("DN")
+	defer C.free(unsafe.Pointer(fdDN))
+	srcDNIndex := C.OGR_FD_GetFieldIndex(C.OGR_L_GetLayerDefn(srcLayer), fdDN)
+	dstDNIndex := C.OGR_FD_GetFieldIndex(dstDefn, fdDN)
+
+	C.OGR_L_ResetReading(srcLayer)
+	for {
+		feat := C.OGR_L_GetNextFeature(srcLayer)
+		if feat == nil {
+			break
+		}
+		geom := C.OGR_F_GetGeometryRef(feat)
+		if geom == nil {
+			C.OGR_F_Destroy(feat)
+			continue
+		}
+		cg := cloneGeom(geom)
+		if cg == nil {
+			C.OGR_F_Destroy(feat)
+			continue
+		}
+		normalized := toMultiPolygon(cg)
+		if normalized != cg {
+			DestroyGeometry(cg)
+			cg = normalized
+		}
+		outFeat := C.OGR_F_Create(dstDefn)
+		if outFeat != nil {
+			if C.OGR_F_SetGeometry(outFeat, cg) == 0 {
+				if srcDNIndex >= 0 && dstDNIndex >= 0 {
+					C.OGR_F_SetFieldInteger(outFeat, dstDNIndex, C.OGR_F_GetFieldAsInteger(feat, srcDNIndex))
+				}
+				C.OGR_L_CreateFeature(dstLayer, outFeat)
+			}
+			C.OGR_F_Destroy(outFeat)
+		}
+		DestroyGeometry(cg)
+		C.OGR_F_Destroy(feat)
+	}
+	C.GDALFlushCache(dstDS)
+	return nil
+}
+
 func CreateEmptyShapefile(path string) error { return createEmptyVector(path, "ESRI Shapefile") }
 func CreateEmptyGeoJSON(path string) error   { return createEmptyVector(path, "GeoJSON") }
 
@@ -462,7 +605,9 @@ func AppendShapefileFeaturesClipped(srcShp string, allowedGeom Geometry, dstShp 
 	}
 	defer C.GDALClose(dstDS)
 	dstDefn := C.OGR_L_GetLayerDefn(dstLayer)
-	dstDNIdx := C.OGR_FD_GetFieldIndex(dstDefn, C.CString("DN"))
+	dnName := C.CString("DN")
+	defer C.free(unsafe.Pointer(dnName))
+	dstDNIdx := C.OGR_FD_GetFieldIndex(dstDefn, dnName)
 
 	var srcSRS C.OGRSpatialReferenceH
 	lsrs := C.OGR_L_GetSpatialRef(srcLayer)
@@ -473,7 +618,7 @@ func AppendShapefileFeaturesClipped(srcShp string, allowedGeom Geometry, dstShp 
 	}
 
 	srcDefn := C.OGR_L_GetLayerDefn(srcLayer)
-	srcDNIdx := C.OGR_FD_GetFieldIndex(srcDefn, C.CString("DN"))
+	srcDNIdx := C.OGR_FD_GetFieldIndex(srcDefn, dnName)
 	C.OGR_L_ResetReading(srcLayer)
 	for {
 		feat := C.OGR_L_GetNextFeature(srcLayer)
@@ -523,22 +668,6 @@ func AppendShapefileFeaturesClipped(srcShp string, allowedGeom Geometry, dstShp 
 	}
 	C.GDALFlushCache(dstDS)
 	return nil
-}
-
-func CountFeaturesInVector(path string) (int, error) {
-	initGeom()
-	cp := C.CString(path)
-	defer C.free(unsafe.Pointer(cp))
-	ds := C.GDALOpenEx(cp, C.GDAL_OF_VECTOR, nil, nil, nil)
-	if ds == nil {
-		return 0, fmt.Errorf("open vector: %s", path)
-	}
-	defer C.GDALClose(ds)
-	layer := C.GDALDatasetGetLayer(ds, 0)
-	if layer == nil {
-		return 0, fmt.Errorf("layer 0 not found: %s", path)
-	}
-	return int(C.OGR_L_GetFeatureCount(layer, 1)), nil
 }
 
 func ConvertShapefileToGeoJSON(srcShp string, outGeoJSON string) error {
@@ -677,7 +806,9 @@ func DissolveOverlappingPolygons(srcShp, dstShp string) error {
 	// Все входящие геометрии (Polygon / MultiPolygon) раскладываем в плоский
 	// список подполигонов и добавляем в MultiPolygon через OGR_G_AddGeometry (копирует).
 	srcDefn := C.OGR_L_GetLayerDefn(srcLayer)
-	dnIdx := C.OGR_FD_GetFieldIndex(srcDefn, C.CString("DN"))
+	dnFieldName := C.CString("DN")
+	defer C.free(unsafe.Pointer(dnFieldName))
+	dnIdx := C.OGR_FD_GetFieldIndex(srcDefn, dnFieldName)
 
 	collByDN := map[int]C.OGRGeometryH{}
 	defer func() {
@@ -779,7 +910,9 @@ func DissolveOverlappingPolygons(srcShp, dstShp string) error {
 		C.OGR_Fld_Destroy(dstDNFieldDef)
 	}
 	dstDefn := C.OGR_L_GetLayerDefn(dstLayer)
-	dstDNIdx := C.OGR_FD_GetFieldIndex(dstDefn, C.CString("DN"))
+	dstDNNameIdx := C.CString("DN")
+	dstDNIdx := C.OGR_FD_GetFieldIndex(dstDefn, dstDNNameIdx)
+	C.free(unsafe.Pointer(dstDNNameIdx))
 
 	writeGeom := func(g C.OGRGeometryH, dn int) {
 		if g == nil || C.OGR_G_IsEmpty(g) != 0 {
@@ -945,21 +1078,55 @@ func ShapefileDifference(newShp, baseShp string, minArea float64) (string, error
 	return outShp, nil
 }
 
-// CountShapefileFeatures возвращает число features в shapefile (для диагностики).
-func CountShapefileFeatures(shp string) int {
-	if shp == "" {
-		return 0
+func affinePoint(geo [6]float64, px, py float64) (float64, float64) {
+	return geo[0] + px*geo[1] + py*geo[2], geo[3] + px*geo[4] + py*geo[5]
+}
+
+// RasterFootprintFromGeo returns the exact affine footprint of a raster in its
+// native CRS. Unlike RectFromGeo it uses all four raster corners and therefore
+// also works for rotated rasters.
+func RasterFootprintFromGeo(geo [6]float64, w, h int) Geometry {
+	initGeom()
+	ring := C.OGR_G_CreateGeometry(C.wkbLinearRing)
+	corners := [][2]float64{{0, 0}, {float64(w), 0}, {float64(w), float64(h)}, {0, float64(h)}}
+	for _, c := range corners {
+		x, y := affinePoint(geo, c[0], c[1])
+		C.OGR_G_AddPoint_2D(ring, C.double(x), C.double(y))
 	}
-	cp := C.CString(shp)
-	defer C.free(unsafe.Pointer(cp))
-	ds := C.GDALOpenEx(cp, C.GDAL_OF_VECTOR, nil, nil, nil)
-	if ds == nil {
-		return 0
+	x, y := affinePoint(geo, 0, 0)
+	C.OGR_G_AddPoint_2D(ring, C.double(x), C.double(y))
+	poly := C.OGR_G_CreateGeometry(C.wkbPolygon)
+	C.OGR_G_AddGeometryDirectly(poly, ring)
+	return poly
+}
+
+// RasterIntersectsAllowedWGS84 checks whether an orthophoto footprint intersects
+// the selected search polygon. The search polygon is stored in WGS84; the raster
+// footprint is transformed from the raster CRS to WGS84 using the full raster WKT.
+func RasterIntersectsAllowedWGS84(geo [6]float64, w, h int, proj string, allowedWGS84 Geometry) (bool, error) {
+	if allowedWGS84 == nil {
+		return true, nil
 	}
-	defer C.GDALClose(ds)
-	lyr := C.GDALDatasetGetLayer(ds, 0)
-	if lyr == nil {
-		return 0
+	rasterGeom := RasterFootprintFromGeo(geo, w, h)
+	if rasterGeom == nil {
+		return false, nil
 	}
-	return int(C.OGR_L_GetFeatureCount(lyr, 1))
+	defer DestroyGeometry(rasterGeom)
+
+	srcSRS, err := projSRSFromWKT(proj)
+	if err != nil {
+		// If projection is unavailable, do not skip the image silently: better to run
+		// inference than to lose true objects because of missing metadata.
+		return true, nil
+	}
+	defer DestroySRS(srcSRS)
+	dstSRS := newEPSG4326SRS()
+	defer DestroySRS(dstSRS)
+
+	wgsGeom, err := transformGeometryToSRS(rasterGeom, srcSRS, dstSRS)
+	if err != nil {
+		return true, nil
+	}
+	defer DestroyGeometry(wgsGeom)
+	return GeometryIntersects(wgsGeom, allowedWGS84), nil
 }

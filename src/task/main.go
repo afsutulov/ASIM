@@ -35,14 +35,15 @@ type Config struct {
 }
 
 type Record struct {
-	Model   string `json:"model"`
-	Poligon string `json:"poligon"`
-	Cloud   *int   `json:"cloud,omitempty"`
-	Start   string `json:"start"`
-	End     string `json:"end"`
-	Time    string `json:"time"`
-	Start2  string `json:"start2,omitempty"`
-	End2    string `json:"end2,omitempty"`
+	Model      string `json:"model"`
+	Preprocess string `json:"preprocess,omitempty"`
+	Poligon    string `json:"poligon"`
+	Cloud      *int   `json:"cloud,omitempty"`
+	Start      string `json:"start"`
+	End        string `json:"end"`
+	Time       string `json:"time"`
+	Start2     string `json:"start2,omitempty"`
+	End2       string `json:"end2,omitempty"`
 }
 
 type QueueItem struct {
@@ -98,8 +99,8 @@ func main() {
 		}
 
 		r := item.Record
-		logger.Printf("picked process: id=%s model=%s poligon=%s cloud=%s start=%s end=%s start2=%s end2=%s time=%s queue=%d",
-			item.ID, r.Model, r.Poligon, cloudString(r.Cloud), r.Start, r.End, r.Start2, r.End2, r.Time, len(queue))
+		logger.Printf("picked process: id=%s model=%s preprocess=%s poligon=%s cloud=%s start=%s end=%s start2=%s end2=%s time=%s queue=%d",
+			item.ID, r.Model, preprocessString(r.Preprocess), r.Poligon, cloudString(r.Cloud), r.Start, r.End, r.Start2, r.End2, r.Time, len(queue))
 
 		exitCode, runErr := runWorker(logger, cfg, *configPath, sentinelPath, ortophotoPath, item)
 
@@ -143,8 +144,8 @@ func main() {
 			time.Sleep(pollInterval)
 			continue
 		}
-		logger.Printf("result saved: id=%s model=%s poligon=%s cloud=%s start=%s end=%s start2=%s end2=%s time=%s zip=%s worker_exit=%d worker_error=%v",
-			item.ID, result.Model, result.Poligon, cloudString(result.Cloud), result.Start, result.End, result.Start2, result.End2, result.Time, zipPath, exitCode, runErr)
+		logger.Printf("result saved: id=%s model=%s preprocess=%s poligon=%s cloud=%s start=%s end=%s start2=%s end2=%s time=%s zip=%s worker_exit=%d worker_error=%v",
+			item.ID, result.Model, preprocessString(result.Preprocess), result.Poligon, cloudString(result.Cloud), result.Start, result.End, result.Start2, result.End2, result.Time, zipPath, exitCode, runErr)
 	}
 }
 
@@ -254,12 +255,34 @@ func oldest(m map[string]Record) (QueueItem, bool) {
 }
 
 func runWorker(logger *log.Logger, cfg Config, configPath, sentinelPath, ortophotoPath string, item QueueItem) (int, error) {
-	spec := cfg.Models[item.Record.Model]
-	switch strings.ToLower(strings.TrimSpace(spec.Preprocess)) {
+	modelKey := strings.TrimSpace(item.Record.Model)
+	spec, ok := cfg.Models[modelKey]
+	if !ok {
+		keys := make([]string, 0, len(cfg.Models))
+		for key := range cfg.Models {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		err := fmt.Errorf("unknown model %q in task queue; available models: %s", modelKey, strings.Join(keys, ", "))
+		logger.Printf("task dispatch failed: id=%s error=%v", item.ID, err)
+		return 2, err
+	}
+
+	preprocess := strings.ToLower(strings.TrimSpace(item.Record.Preprocess))
+	if preprocess == "" {
+		preprocess = strings.ToLower(strings.TrimSpace(spec.Preprocess))
+	}
+	logger.Printf("dispatch worker: id=%s model=%s preprocess=%s", item.ID, modelKey, preprocessString(preprocess))
+
+	switch preprocess {
 	case "ortophoto":
 		return runOrthophoto(logger, configPath, ortophotoPath, item)
-	default:
+	case "sentinel", "sentinel2a", "identity", "pathology", "pathology_diff":
 		return runSentinel(logger, configPath, sentinelPath, item)
+	default:
+		err := fmt.Errorf("unsupported preprocess %q for model %q", preprocess, modelKey)
+		logger.Printf("task dispatch failed: id=%s error=%v", item.ID, err)
+		return 2, err
 	}
 }
 
@@ -326,6 +349,14 @@ func parseTime(s string) time.Time {
 		}
 	}
 	return time.Unix(0, 0)
+}
+
+func preprocessString(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "<unset>"
+	}
+	return v
 }
 
 func cloudString(v *int) string {

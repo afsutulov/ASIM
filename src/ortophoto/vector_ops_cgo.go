@@ -102,6 +102,198 @@ func transformWGS84GeometryToSRS(g Geometry, dstSRS C.OGRSpatialReferenceH) (Geo
 	return cg, nil
 }
 
+// transformGeometryToSRS converts geometry directly from srcSRS to dstSRS using a single
+// coordinate transformation (e.g. МСК 59-1 <-> МСК 59-2 <-> МСК 59-3, same Pulkovo 1942 datum).
+// This intentionally avoids any intermediate hop through WGS84: ортофото-снимки и итоговые
+// полигоны должны оставаться в МСК-59 (с учётом зоны), а лишний WGS84-roundtrip вносит
+// систематическую погрешность из-за параметров Гельмерта (Pulkovo1942 -> WGS84), см. BUGFIX notes.
+func transformGeometryToSRS(g Geometry, srcSRS, dstSRS C.OGRSpatialReferenceH) (Geometry, error) {
+	if g == nil {
+		return nil, nil
+	}
+	if srcSRS == nil || dstSRS == nil {
+		return cloneGeom(g), nil
+	}
+	if C.OSRIsSame(srcSRS, dstSRS) != 0 {
+		return cloneGeom(g), nil
+	}
+	C._set_traditional_gis_order(srcSRS)
+	C._set_traditional_gis_order(dstSRS)
+	ct := C.OCTNewCoordinateTransformation(srcSRS, dstSRS)
+	if ct == nil {
+		return nil, fmt.Errorf("create coordinate transformation between source CRS failed")
+	}
+	defer C.OCTDestroyCoordinateTransformation(ct)
+	cg := cloneGeom(g)
+	if cg == nil {
+		return nil, fmt.Errorf("clone geometry failed")
+	}
+	if C.OGR_G_Transform(cg, ct) != 0 {
+		DestroyGeometry(cg)
+		return nil, fmt.Errorf("geometry transform between source CRS failed")
+	}
+	return cg, nil
+}
+
+func DestroySRS(srs C.OGRSpatialReferenceH) {
+	if srs != nil {
+		C.OSRDestroySpatialReference(srs)
+	}
+}
+
+// ClipShapefileToGeometryWithSRSWKT работает как ClipShapefileToGeometry, но
+// для трансформации clipGeom (WGS84) в СК снимка использует ЯВНО переданный
+// rasterWKT — полный WKT проекции исходного растра (например img.Proj),
+// а не СК, заново прочитанную из .prj файла shapefile.
+//
+// Это важно: при записи в ESRI Shapefile (.prj использует устаревший WKT1)
+// GDAL ТЕРЯЕТ параметры датум-трансформации (BOUNDCRS/TOWGS84) — Pulkovo1942
+// -> WGS84 (Helmert 7 параметров), которые присутствуют в исходном geotiff
+// (МСК-59 хранится как BOUNDCRS с ABRIDGEDTRANSFORMATION к WGS84). После
+// перечитывания .prj обратно получается "голая" PROJCS без датум-сдвига —
+// поэтому трансформация шаблона полигона поиска (WGS84) в СК снимка либо
+// падает с ошибкой, либо даёт грубо неверные координаты, и clip-результат
+// оказывается пустым. Используя исходный WKT растра напрямую, мы сохраняем
+// корректную привязку Pulkovo1942 <-> WGS84 на всём пути.
+func ClipShapefileToGeometryWithSRSWKT(inShp string, outShp string, clipGeom Geometry, rasterWKT string) error {
+	C._gdal_init_vector_once()
+	removeShapefileSet(outShp)
+
+	inC := C.CString(inShp)
+	defer C.free(unsafe.Pointer(inC))
+	ds := C.GDALOpenEx(inC, C.GDAL_OF_VECTOR, nil, nil, nil)
+	if ds == nil {
+		return fmt.Errorf("open vector: %s", inShp)
+	}
+	defer C.GDALClose(ds)
+	layer := C.GDALDatasetGetLayer(ds, 0)
+	if layer == nil {
+		return fmt.Errorf("layer 0 not found: %s", inShp)
+	}
+
+	// СК для самого clip-преобразования берём из полного WKT растра (с датум-сдвигом),
+	// а не из СК слоя shapefile (она урезана при сохранении в .prj).
+	var rasterSRS C.OGRSpatialReferenceH
+	if strings.TrimSpace(rasterWKT) != "" {
+		rasterSRS = C.OSRNewSpatialReference(nil)
+		cwkt := C.CString(rasterWKT)
+		defer C.free(unsafe.Pointer(cwkt))
+		pwkt := cwkt
+		if C.OSRImportFromWkt(rasterSRS, (**C.char)(unsafe.Pointer(&pwkt))) != 0 {
+			C.OSRDestroySpatialReference(rasterSRS)
+			rasterSRS = nil
+		}
+	}
+	if rasterSRS == nil {
+		// Фолбэк на старое поведение, если WKT растра недоступен/некорректен.
+		rasterSRS = C.OGR_L_GetSpatialRef(layer)
+	} else {
+		defer C.OSRDestroySpatialReference(rasterSRS)
+	}
+
+	var clippedGeom Geometry
+	if clipGeom != nil {
+		var err error
+		clippedGeom, err = transformWGS84GeometryToSRS(clipGeom, rasterSRS)
+		if err != nil {
+			return fmt.Errorf("transform clipping geometry to layer SRS: %w", err)
+		}
+		defer DestroyGeometry(clippedGeom)
+	}
+
+	// Для записи выходного shapefile используем СК самого слоя (она совпадает
+	// геометрически с rasterSRS, только без датум-сдвига, что для итоговых
+	// shapefile-полигонов в той же зоне МСК-59 значения не имеет — координаты
+	// уже посчитаны в этой проекции и трансформации больше не подвергаются).
+	inSRS := C.OGR_L_GetSpatialRef(layer)
+
+	drvName := C.CString("ESRI Shapefile")
+	defer C.free(unsafe.Pointer(drvName))
+	drv := C.OGRGetDriverByName(drvName)
+	if drv == nil {
+		return fmt.Errorf("OGR driver ESRI Shapefile not found")
+	}
+	outC := C.CString(outShp)
+	defer C.free(unsafe.Pointer(outC))
+	ods := C.OGR_Dr_CreateDataSource(drv, outC, nil)
+	if ods == nil {
+		return fmt.Errorf("create shp: %s", outShp)
+	}
+	defer C.OGR_DS_Destroy(ods)
+
+	layerName := C.CString("result")
+	defer C.free(unsafe.Pointer(layerName))
+	srsCopy := C._clone_srs(inSRS)
+	if srsCopy != nil {
+		defer C.OSRDestroySpatialReference(srsCopy)
+	}
+	outLayer := C.OGR_DS_CreateLayer(ods, layerName, srsCopy, C.wkbPolygon, nil)
+	if outLayer == nil {
+		return fmt.Errorf("failed to create output layer")
+	}
+
+	fieldName := C.CString("DN")
+	defer C.free(unsafe.Pointer(fieldName))
+	fd := C.OGR_Fld_Create(fieldName, C.OFTInteger)
+	defer C.OGR_Fld_Destroy(fd)
+	if C.OGR_L_CreateField(outLayer, fd, 1) != 0 {
+		return fmt.Errorf("failed to create DN field")
+	}
+	outDefn := C.OGR_L_GetLayerDefn(outLayer)
+
+	if err := clipFeaturesInto(layer, outDefn, outLayer, clippedGeom); err != nil {
+		return err
+	}
+	C.OGR_DS_SyncToDisk(ods)
+	return nil
+}
+
+// clipFeaturesInto копирует все фичи из layer в outLayer (через outDefn), при
+// необходимости пересекая каждую геометрию с clippedGeom. Общая часть для
+// ClipShapefileToGeometry и ClipShapefileToGeometryWithSRSWKT.
+func clipFeaturesInto(layer C.OGRLayerH, outDefn C.OGRFeatureDefnH, outLayer C.OGRLayerH, clippedGeom Geometry) error {
+	C.OGR_L_ResetReading(layer)
+	for {
+		feat := C.OGR_L_GetNextFeature(layer)
+		if feat == nil {
+			break
+		}
+		geom := C.OGR_F_GetGeometryRef(feat)
+		if geom == nil {
+			C.OGR_F_Destroy(feat)
+			continue
+		}
+		// If clipGeom is nil, copy as is
+		useGeom := geom
+		var inter C.OGRGeometryH
+		if clippedGeom != nil {
+			if C.OGR_G_Intersects(geom, clippedGeom) == 0 {
+				C.OGR_F_Destroy(feat)
+				continue
+			}
+			inter = C.OGR_G_Intersection(geom, clippedGeom)
+			if inter == nil || C.OGR_G_IsEmpty(inter) != 0 {
+				if inter != nil {
+					C.OGR_G_DestroyGeometry(inter)
+				}
+				C.OGR_F_Destroy(feat)
+				continue
+			}
+			useGeom = inter
+		}
+		outFeat := C.OGR_F_Create(outDefn)
+		C.OGR_F_SetFieldInteger(outFeat, 0, C.OGR_F_GetFieldAsInteger(feat, 0))
+		C.OGR_F_SetGeometry(outFeat, useGeom)
+		C.OGR_L_CreateFeature(outLayer, outFeat)
+		C.OGR_F_Destroy(outFeat)
+		if inter != nil {
+			C.OGR_G_DestroyGeometry(inter)
+		}
+		C.OGR_F_Destroy(feat)
+	}
+	return nil
+}
+
 func ClipShapefileToGeometry(inShp string, outShp string, clipGeom Geometry) error {
 	C._gdal_init_vector_once()
 	removeShapefileSet(outShp)
@@ -163,57 +355,85 @@ func ClipShapefileToGeometry(inShp string, outShp string, clipGeom Geometry) err
 	}
 	outDefn := C.OGR_L_GetLayerDefn(outLayer)
 
-	C.OGR_L_ResetReading(layer)
-	for {
-		feat := C.OGR_L_GetNextFeature(layer)
-		if feat == nil {
-			break
-		}
-		geom := C.OGR_F_GetGeometryRef(feat)
-		if geom == nil {
-			C.OGR_F_Destroy(feat)
-			continue
-		}
-		// If clipGeom is nil, copy as is
-		useGeom := geom
-		var inter C.OGRGeometryH
-		if clippedGeom != nil {
-			if C.OGR_G_Intersects(geom, clippedGeom) == 0 {
-				C.OGR_F_Destroy(feat)
-				continue
-			}
-			inter = C.OGR_G_Intersection(geom, clippedGeom)
-			if inter == nil || C.OGR_G_IsEmpty(inter) != 0 {
-				if inter != nil {
-					C.OGR_G_DestroyGeometry(inter)
-				}
-				C.OGR_F_Destroy(feat)
-				continue
-			}
-			useGeom = inter
-		}
-		outFeat := C.OGR_F_Create(outDefn)
-		C.OGR_F_SetFieldInteger(outFeat, 0, C.OGR_F_GetFieldAsInteger(feat, 0))
-		C.OGR_F_SetGeometry(outFeat, useGeom)
-		C.OGR_L_CreateFeature(outLayer, outFeat)
-		C.OGR_F_Destroy(outFeat)
-		if inter != nil {
-			C.OGR_G_DestroyGeometry(inter)
-		}
-		C.OGR_F_Destroy(feat)
+	if err := clipFeaturesInto(layer, outDefn, outLayer, clippedGeom); err != nil {
+		return err
 	}
 	C.OGR_DS_SyncToDisk(ods)
 	return nil
 }
 
-func AppendShapefileToGeoJSON(srcShp string, outGeoJSON string) error {
+// CreateEmptyAccumulatorShapefile создаёт пустой накопительный shapefile в заданной СК
+// (СК первого обработанного снимка — МСК-59 нужной зоны). Все последующие снимки,
+// даже если они относятся к другой зоне МСК-59, будут приведены к этой же СК
+// напрямую (зона -> зона), без прохода через WGS84.
+func CreateEmptyAccumulatorShapefile(path string, srs C.OGRSpatialReferenceH) error {
 	C._gdal_init_vector_once()
+	removeShapefileSet(path)
 
-	if _, err := os.Stat(outGeoJSON); err != nil {
-		if err := CreateEmptyGeoJSON(outGeoJSON); err != nil {
-			return err
-		}
+	drvName := C.CString("ESRI Shapefile")
+	defer C.free(unsafe.Pointer(drvName))
+	drv := C.OGRGetDriverByName(drvName)
+	if drv == nil {
+		return fmt.Errorf("OGR driver ESRI Shapefile not found")
 	}
+	cp := C.CString(path)
+	defer C.free(unsafe.Pointer(cp))
+	ds := C.OGR_Dr_CreateDataSource(drv, cp, nil)
+	if ds == nil {
+		return fmt.Errorf("create shp: %s", path)
+	}
+	defer C.OGR_DS_Destroy(ds)
+
+	layerName := C.CString("result")
+	defer C.free(unsafe.Pointer(layerName))
+	srsCopy := C._clone_srs(srs)
+	if srsCopy != nil {
+		defer C.OSRDestroySpatialReference(srsCopy)
+	}
+	layer := C.OGR_DS_CreateLayer(ds, layerName, srsCopy, C.wkbMultiPolygon, nil)
+	if layer == nil {
+		return fmt.Errorf("create shp layer failed: %s", path)
+	}
+	fieldName := C.CString("DN")
+	defer C.free(unsafe.Pointer(fieldName))
+	fd := C.OGR_Fld_Create(fieldName, C.OFTInteger)
+	defer C.OGR_Fld_Destroy(fd)
+	if C.OGR_L_CreateField(layer, fd, 1) != 0 {
+		return fmt.Errorf("failed to create DN field: %s", path)
+	}
+	C.OGR_DS_SyncToDisk(ds)
+	return nil
+}
+
+// ReadLayerSRS открывает векторный файл (shapefile/GeoJSON) и возвращает копию
+// пространственной привязки его первого слоя.
+func ReadLayerSRS(path string) (C.OGRSpatialReferenceH, error) {
+	C._gdal_init_vector_once()
+	cp := C.CString(path)
+	defer C.free(unsafe.Pointer(cp))
+	ds := C.GDALOpenEx(cp, C.GDAL_OF_VECTOR, nil, nil, nil)
+	if ds == nil {
+		return nil, fmt.Errorf("open vector: %s", path)
+	}
+	defer C.GDALClose(ds)
+	layer := C.GDALDatasetGetLayer(ds, 0)
+	if layer == nil {
+		return nil, fmt.Errorf("layer 0 not found: %s", path)
+	}
+	lsrs := C.OGR_L_GetSpatialRef(layer)
+	if lsrs == nil {
+		return nil, nil
+	}
+	return C._clone_srs(lsrs), nil
+}
+
+// AppendShapefileToAccumulator переносит геометрии из srcShp (СК снимка — МСК-59 нужной
+// зоны) в накопительный shapefile outShp, который уже создан в целевой СК (СК первого
+// снимка результата). Если СК снимка отличается зоной МСК-59 от целевой СК, выполняется
+// прямая трансформация зона -> зона (общий датум Pulkovo 1942), БЕЗ прохода через WGS84 —
+// это критично для точности результата, который впоследствии сверяется с кадастром.
+func AppendShapefileToAccumulator(srcShp string, outShp string) error {
+	C._gdal_init_vector_once()
 
 	srcCP := C.CString(srcShp)
 	defer C.free(unsafe.Pointer(srcCP))
@@ -228,7 +448,7 @@ func AppendShapefileToGeoJSON(srcShp string, outGeoJSON string) error {
 		return fmt.Errorf("source layer not found: %s", srcShp)
 	}
 
-	dstDS, dstLayer, err := openLayerForAppend(outGeoJSON)
+	dstDS, dstLayer, err := openLayerForAppend(outShp)
 	if err != nil {
 		return err
 	}
@@ -246,6 +466,7 @@ func AppendShapefileToGeoJSON(srcShp string, outGeoJSON string) error {
 		C._set_traditional_gis_order(srcSRS)
 		defer C.OSRDestroySpatialReference(srcSRS)
 	}
+	dstSRS := C.OGR_L_GetSpatialRef(dstLayer)
 
 	C.OGR_L_ResetReading(srcLayer)
 	for {
@@ -258,17 +479,22 @@ func AppendShapefileToGeoJSON(srcShp string, outGeoJSON string) error {
 			C.OGR_F_Destroy(feat)
 			continue
 		}
-		wg, err := reprojectGeometryToWGS84(geom, srcSRS)
-		if err != nil || wg == nil || GeometryIsEmpty(wg) {
-			if wg != nil {
-				DestroyGeometry(wg)
+		tg, err := transformGeometryToSRS(geom, srcSRS, dstSRS)
+		if err != nil || tg == nil || GeometryIsEmpty(tg) {
+			if tg != nil {
+				DestroyGeometry(tg)
 			}
 			C.OGR_F_Destroy(feat)
 			continue
 		}
+		normalized := toMultiPolygon(tg)
+		if normalized != tg {
+			DestroyGeometry(tg)
+			tg = normalized
+		}
 		outFeat := C.OGR_F_Create(dstDefn)
 		if outFeat != nil {
-			if C.OGR_F_SetGeometry(outFeat, wg) == 0 {
+			if C.OGR_F_SetGeometry(outFeat, tg) == 0 {
 				if srcDNIndex >= 0 && dstDNIndex >= 0 {
 					C.OGR_F_SetFieldInteger(outFeat, dstDNIndex, C.OGR_F_GetFieldAsInteger(feat, srcDNIndex))
 				}
@@ -276,92 +502,9 @@ func AppendShapefileToGeoJSON(srcShp string, outGeoJSON string) error {
 			}
 			C.OGR_F_Destroy(outFeat)
 		}
-		DestroyGeometry(wg)
+		DestroyGeometry(tg)
 		C.OGR_F_Destroy(feat)
 	}
 	C.GDALFlushCache(dstDS)
-	return nil
-}
-
-func ExportGeoJSONToShapefile(srcGeoJSON string, dstShp string) error {
-	C._gdal_init_vector_once()
-	removeShapefileSet(dstShp)
-
-	srcCP := C.CString(srcGeoJSON)
-	defer C.free(unsafe.Pointer(srcCP))
-	srcDS := C.GDALOpenEx(srcCP, C.GDAL_OF_VECTOR, nil, nil, nil)
-	if srcDS == nil {
-		return fmt.Errorf("open geojson: %s", srcGeoJSON)
-	}
-	defer C.GDALClose(srcDS)
-
-	srcLayer := C.GDALDatasetGetLayer(srcDS, 0)
-	if srcLayer == nil {
-		return fmt.Errorf("geojson layer not found: %s", srcGeoJSON)
-	}
-
-	drvName := C.CString("ESRI Shapefile")
-	defer C.free(unsafe.Pointer(drvName))
-	drv := C.OGRGetDriverByName(drvName)
-	if drv == nil {
-		return fmt.Errorf("OGR driver ESRI Shapefile not found")
-	}
-
-	dstCP := C.CString(dstShp)
-	defer C.free(unsafe.Pointer(dstCP))
-	dstDS := C.OGR_Dr_CreateDataSource(drv, dstCP, nil)
-	if dstDS == nil {
-		return fmt.Errorf("create shp: %s", dstShp)
-	}
-	defer C.OGR_DS_Destroy(dstDS)
-
-	layerName := C.CString("result")
-	defer C.free(unsafe.Pointer(layerName))
-
-	wgs84 := C.OSRNewSpatialReference(nil)
-	defer C.OSRDestroySpatialReference(wgs84)
-	wgsName := C.CString("WGS84")
-	defer C.free(unsafe.Pointer(wgsName))
-	C.OSRSetWellKnownGeogCS(wgs84, wgsName)
-	C._set_traditional_gis_order(wgs84)
-
-	dstLayer := C.OGR_DS_CreateLayer(dstDS, layerName, wgs84, C.wkbPolygon, nil)
-	if dstLayer == nil {
-		return fmt.Errorf("create shp layer failed")
-	}
-
-	fieldName := C.CString("DN")
-	defer C.free(unsafe.Pointer(fieldName))
-	fd := C.OGR_Fld_Create(fieldName, C.OFTInteger)
-	defer C.OGR_Fld_Destroy(fd)
-	C.OGR_L_CreateField(dstLayer, fd, 1)
-
-	dstDefn := C.OGR_L_GetLayerDefn(dstLayer)
-	srcDefn := C.OGR_L_GetLayerDefn(srcLayer)
-	srcDN := C.OGR_FD_GetFieldIndex(srcDefn, fieldName)
-
-	C.OGR_L_ResetReading(srcLayer)
-	for {
-		feat := C.OGR_L_GetNextFeature(srcLayer)
-		if feat == nil {
-			break
-		}
-		geom := C.OGR_F_GetGeometryRef(feat)
-		if geom == nil {
-			C.OGR_F_Destroy(feat)
-			continue
-		}
-		outFeat := C.OGR_F_Create(dstDefn)
-		C.OGR_F_SetGeometry(outFeat, geom)
-		if srcDN >= 0 {
-			C.OGR_F_SetFieldInteger(outFeat, 0, C.OGR_F_GetFieldAsInteger(feat, srcDN))
-		} else {
-			C.OGR_F_SetFieldInteger(outFeat, 0, 1)
-		}
-		C.OGR_L_CreateFeature(dstLayer, outFeat)
-		C.OGR_F_Destroy(outFeat)
-		C.OGR_F_Destroy(feat)
-	}
-	C.OGR_DS_SyncToDisk(dstDS)
 	return nil
 }

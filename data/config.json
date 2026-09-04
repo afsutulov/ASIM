@@ -15,19 +15,31 @@
   "ortophoto": "/mnt/share/newest/Ortophoto",
   "preprocess": {
     "sentinel": {
-      "name": "Поиск объектов по спутниковым снимкам Sentinel2",
-      "list": ["sentinel", "sentinel2A", "identity", "pathology"]
+      "name": "Спутниковые снимки Sentinel2",
+      "list": [
+        "sentinel",
+        "sentinel2A",
+        "identity",
+        "pathology"
+      ]
     },
     "ortophoto": {
-      "name": "Поиск объектов по ортофото снимкам",
+      "name": "Ортофото снимкам (снимки с БПЛА)",
       "list": ["ortophoto"]
     }
+  },
+  "compute": {
+    "device": "gpu",
+    "gpus": [
+      0,
+      1
+    ]
   },
   "models": {
     "hogweed": {
       "description": "Зарастание Борщевиком Сосновского",
       "onnx_file": "hogweed.onnx",
-      "channels": ["B04","B03","B02","B08"],
+      "channels": ["B04", "B03", "B02", "B08"],
       "tile": 256,
       "bound": 32,
       "threshold": 0.6,
@@ -291,20 +303,380 @@
       },
       "preserve_native_resolution": true
     },
-    "uchastki": {
-      "description": "Границы земельных участков по ортофото снимкам)",
-      "onnx_file": "uchastki.onnx",
-      "channels": ["R", "G", "B"],
-      "tile": 512,
-      "bound": 32,
-      "threshold": 0.5,
+    "buildings": {
+      "description": "Здания",
+      "onnx_file": "buildings.onnx",
       "preprocess": "ortophoto",
-      "inputs": 1,
+      "num_classes": 5,
+      "classes": [0],
+      "tile": 1536,
+      "bound": 128,
+      "normalization": "fixed",
+      "threshold": 0.25,
+      "class_thresholds": {
+        "0": 0.4,
+        "1": 0.4,
+        "2": 0.7,
+        "3": 0.45,
+        "4": 0.4
+      },
+      "nms_threshold": 0.45,
+      "agnostic_nms": false,
+      "exclusive_classes": true,
+      "mask_threshold": 0.5,
+      "yolo_mask_dim": 32,
+      "yolo_proto_stride": 4,
+      "input_name": "images",
+      "output_names": ["output0", "output1"],
       "min_area": 10,
+      "min_area_m2": 10,
+      "morph_open": 0,
+      "morph_close": 0,
+      "fill_holes": false,
+      "max_hole_area": 0,
       "simplify": 0,
-      "merge": false,
-      "input_name": "input",
-      "output_name": "logits"
+      "reject_tile_mask_ratio": 0,
+      "reject_tile_edge_touches": 0,
+      "reject_rectangularity": 0,
+      "reject_min_box_tile_ratio": 0,
+      "reject_edge_boxfill": 0,
+      "reject_boxfill": 0,
+      "reject_boxfill_score": 0,
+      "reject_dfl_size_tol": 0,
+      "reject_repeat_count": 0,
+      "skip_empty_tiles": true,
+      "min_content_pixels": 1,
+      "class_merge_rules": [
+        {
+          "target_class": 0,
+          "source_classes": [
+            1
+          ],
+          "distance_m": 0.3
+        }
+      ]
+    },
+    "pavilion": {
+      "description": "Сооружения",
+      "onnx_file": "buildings.onnx",
+      "preprocess": "ortophoto",
+      "num_classes": 5,
+      "classes": [1],
+      "tile": 1536,
+      "bound": 128,
+      "normalization": "fixed",
+      "threshold": 0.25,
+      "class_thresholds": {
+        "0": 0.4,
+        "1": 0.4,
+        "2": 0.7,
+        "3": 0.45,
+        "4": 0.4
+      },
+      "nms_threshold": 0.45,
+      "agnostic_nms": false,
+      "exclusive_classes": true,
+      "mask_threshold": 0.5,
+      "yolo_mask_dim": 32,
+      "yolo_proto_stride": 4,
+      "input_name": "images",
+      "output_names": ["output0", "output1"],
+      "min_area": 10,
+      "min_area_m2": 10,
+      "morph_open": 0,
+      "morph_close": 0,
+      "fill_holes": false,
+      "max_hole_area": 0,
+      "simplify": 0,
+      "reject_tile_mask_ratio": 0,
+      "reject_tile_edge_touches": 0,
+      "reject_rectangularity": 0,
+      "reject_min_box_tile_ratio": 0,
+      "reject_edge_boxfill": 0,
+      "reject_boxfill": 0,
+      "reject_boxfill_score": 0,
+      "reject_dfl_size_tol": 0,
+      "reject_repeat_count": 0,
+      "skip_empty_tiles": true,
+      "min_content_pixels": 1,
+      "class_merge_rules": [
+        {
+          "target_class": 0,
+          "source_classes": [
+            1
+          ],
+          "distance_m": 0.3
+        }
+      ]
+    },
+    "grunt": {
+      "description": "Грунт (грядки, вспаханная почва)",
+      "onnx_file": "buildings.onnx",
+      "preprocess": "ortophoto",
+      "num_classes": 5,
+      "classes": [2],
+      "tile": 1536,
+      "bound": 128,
+      "normalization": "fixed",
+      "threshold": 0.25,
+      "class_thresholds": {
+        "0": 0.4,
+        "1": 0.4,
+        "2": 0.7,
+        "3": 0.45,
+        "4": 0.4
+      },
+      "nms_threshold": 0.45,
+      "agnostic_nms": false,
+      "exclusive_classes": true,
+      "mask_threshold": 0.5,
+      "yolo_mask_dim": 32,
+      "yolo_proto_stride": 4,
+      "input_name": "images",
+      "output_names": ["output0", "output1"],
+      "min_area": 5,
+      "min_area_m2": 5,
+      "morph_open": 0,
+      "morph_close": 0,
+      "fill_holes": false,
+      "max_hole_area": 0,
+      "simplify": 0,
+      "reject_tile_mask_ratio": 0,
+      "reject_tile_edge_touches": 0,
+      "reject_rectangularity": 0,
+      "reject_min_box_tile_ratio": 0,
+      "reject_edge_boxfill": 0,
+      "reject_boxfill": 0,
+      "reject_boxfill_score": 0,
+      "reject_dfl_size_tol": 0,
+      "reject_repeat_count": 0,
+      "skip_empty_tiles": true,
+      "min_content_pixels": 1,
+      "class_merge_rules": [
+        {
+          "target_class": 0,
+          "source_classes": [
+            1
+          ],
+          "distance_m": 0.3
+        }
+      ]
+    },
+    "gazone": {
+      "description": "Газоны",
+      "onnx_file": "buildings.onnx",
+      "preprocess": "ortophoto",
+      "num_classes": 5,
+      "classes": [3],
+      "tile": 1536,
+      "bound": 128,
+      "normalization": "fixed",
+      "threshold": 0.25,
+      "class_thresholds": {
+        "0": 0.4,
+        "1": 0.4,
+        "2": 0.7,
+        "3": 0.45,
+        "4": 0.4
+      },
+      "nms_threshold": 0.45,
+      "agnostic_nms": false,
+      "exclusive_classes": true,
+      "mask_threshold": 0.5,
+      "yolo_mask_dim": 32,
+      "yolo_proto_stride": 4,
+      "input_name": "images",
+      "output_names": ["output0", "output1"],
+      "min_area": 5,
+      "min_area_m2": 5,
+      "morph_open": 0,
+      "morph_close": 0,
+      "fill_holes": false,
+      "max_hole_area": 0,
+      "simplify": 0,
+      "reject_tile_mask_ratio": 0,
+      "reject_tile_edge_touches": 0,
+      "reject_rectangularity": 0,
+      "reject_min_box_tile_ratio": 0,
+      "reject_edge_boxfill": 0,
+      "reject_boxfill": 0,
+      "reject_boxfill_score": 0,
+      "reject_dfl_size_tol": 0,
+      "reject_repeat_count": 0,
+      "skip_empty_tiles": true,
+      "min_content_pixels": 1,
+      "class_merge_rules": [
+        {
+          "target_class": 0,
+          "source_classes": [
+            1
+          ],
+          "distance_m": 0.3
+        }
+      ]
+    },
+    "pokritie": {
+      "description": "Тротуарное покрытие",
+      "onnx_file": "buildings.onnx",
+      "preprocess": "ortophoto",
+      "num_classes": 5,
+      "classes": [4],
+      "tile": 1536,
+      "bound": 128,
+      "normalization": "fixed",
+      "threshold": 0.25,
+      "class_thresholds": {
+        "0": 0.4,
+        "1": 0.4,
+        "2": 0.7,
+        "3": 0.45,
+        "4": 0.4
+      },
+      "nms_threshold": 0.45,
+      "agnostic_nms": false,
+      "exclusive_classes": true,
+      "mask_threshold": 0.5,
+      "yolo_mask_dim": 32,
+      "yolo_proto_stride": 4,
+      "input_name": "images",
+      "output_names": ["output0", "output1"],
+      "min_area": 5,
+      "min_area_m2": 5,
+      "morph_open": 0,
+      "morph_close": 0,
+      "fill_holes": false,
+      "max_hole_area": 0,
+      "simplify": 0,
+      "reject_tile_mask_ratio": 0,
+      "reject_tile_edge_touches": 0,
+      "reject_rectangularity": 0,
+      "reject_min_box_tile_ratio": 0,
+      "reject_edge_boxfill": 0,
+      "reject_boxfill": 0,
+      "reject_boxfill_score": 0,
+      "reject_dfl_size_tol": 0,
+      "reject_repeat_count": 0,
+      "skip_empty_tiles": true,
+      "min_content_pixels": 1,
+      "class_merge_rules": [
+        {
+          "target_class": 0,
+          "source_classes": [
+            1
+          ],
+          "distance_m": 0.3
+        }
+      ]
+    },
+    "uchastki": {
+      "description": "Участки (грунт, газоны, покрытие)",
+      "onnx_file": "buildings.onnx",
+      "preprocess": "ortophoto",
+      "num_classes": 5,
+      "classes": [2, 3, 4],
+      "tile": 1536,
+      "bound": 128,
+      "normalization": "fixed",
+      "threshold": 0.25,
+      "class_thresholds": {
+        "0": 0.4,
+        "1": 0.4,
+        "2": 0.7,
+        "3": 0.45,
+        "4": 0.4
+      },
+      "nms_threshold": 0.45,
+      "agnostic_nms": false,
+      "exclusive_classes": true,
+      "mask_threshold": 0.5,
+      "yolo_mask_dim": 32,
+      "yolo_proto_stride": 4,
+      "input_name": "images",
+      "output_names": ["output0", "output1"],
+      "min_area": 5,
+      "min_area_m2": 5,
+      "morph_open": 0,
+      "morph_close": 0,
+      "fill_holes": false,
+      "max_hole_area": 0,
+      "simplify": 0,
+      "reject_tile_mask_ratio": 0,
+      "reject_tile_edge_touches": 0,
+      "reject_rectangularity": 0,
+      "reject_min_box_tile_ratio": 0,
+      "reject_edge_boxfill": 0,
+      "reject_boxfill": 0,
+      "reject_boxfill_score": 0,
+      "reject_dfl_size_tol": 0,
+      "reject_repeat_count": 0,
+      "skip_empty_tiles": true,
+      "min_content_pixels": 1,
+      "class_merge_rules": [
+        {
+          "target_class": 0,
+          "source_classes": [
+            1
+          ],
+          "distance_m": 0.3
+        }
+      ]
+    },
+    "hogweed_bpla": {
+      "description": "Зарастание Борщевиком Сосновского (БПЛА)",
+      "onnx_file": "hogweed_bpla.onnx",
+      "preprocess": "ortophoto",
+
+      "num_classes": 1,
+      "classes": [0],
+
+      "tile": 1536,
+      "bound": 128,
+
+      "normalization": "fixed",
+
+      "threshold": 0.25,
+
+      "class_thresholds": {
+        "0": 0.25
+      },
+
+      "nms_threshold": 0.45,
+      "agnostic_nms": false,
+      "exclusive_classes": true,
+
+      "mask_threshold": 0.5,
+
+      "yolo_mask_dim": 32,
+      "yolo_proto_stride": 4,
+
+      "input_name": "images",
+      "output_names": ["output0", "output1"],
+
+      "min_area": 10,
+      "min_area_m2": 1,
+
+      "morph_open": 0,
+      "morph_close": 0,
+
+      "fill_holes": false,
+      "max_hole_area": 0,
+
+      "simplify": 0,
+
+      "reject_tile_mask_ratio": 0,
+      "reject_tile_edge_touches": 0,
+      "reject_rectangularity": 0,
+      "reject_min_box_tile_ratio": 0,
+      "reject_edge_boxfill": 0,
+      "reject_boxfill": 0,
+      "reject_boxfill_score": 0,
+      "reject_dfl_size_tol": 0,
+      "reject_repeat_count": 0,
+
+      "skip_empty_tiles": true,
+      "min_content_pixels": 1,
+
+      "class_merge_rules": []
     }
   }
 }

@@ -4,44 +4,70 @@ import "math"
 
 func makeUint8Mask(n int) []uint8 { return make([]uint8, n) }
 
+// hasAnyValidPixel returns true when a patch contains at least one pixel from
+// the useful raster area. A patch with an entirely zero ValidMask cannot
+// contribute a valid output polygon and can be skipped without changing the
+// search result.
+func hasAnyValidPixel(valid []uint8) bool {
+	if valid == nil {
+		return true
+	}
+	for _, value := range valid {
+		if value != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// isMostlyEmptyTile решает, можно ли пропустить тайл без инференса.
+//
+// ВАЖНО (исправление пропуска сегментов зданий): пропускаем ТОЛЬКО практически
+// пустые тайлы — те, в которых число валидных не-белых пикселей меньше
+// minContentPixels (то есть тайл почти целиком состоит из nodata и/или белой
+// каймы листа ортофото).
+//
+// Прежняя версия отбрасывала тайлы по ОТНОСИТЕЛЬНЫМ порогам: >=90% белых
+// пикселей или <5% валидных. Для тайла 1536x1536 это до ~236 тыс. «настоящих»
+// пикселей, которые молча выбрасывались вместе с тайлом. Если у края листа
+// ортофото в такой тайл попадал фрагмент здания, он исчезал из результата
+// целым прямоугольным сегментом с ровными границами по сетке тайлов.
 func isMostlyEmptyTile(
 	data []float32,
 	valid []uint8,
 	channels, width, height int,
 	whiteThreshold float32,
-	whiteRatio float64,
-	minValidRatio float64,
+	minContentPixels int,
 ) bool {
-	if width*height == 0 {
+	n := width * height
+	if n == 0 {
 		return true
 	}
-	validCount := 0
-	whiteCount := 0
-	for i := 0; i < width*height; i++ {
+	if minContentPixels < 1 {
+		minContentPixels = 1
+	}
+	content := 0
+	for i := 0; i < n; i++ {
 		if valid != nil && valid[i] == 0 {
 			continue
 		}
-		validCount++
 		allWhite := true
 		for c := 0; c < channels; c++ {
-			v := data[c*width*height+i]
+			v := data[c*n+i]
 			if v < whiteThreshold {
 				allWhite = false
 				break
 			}
 		}
-		if allWhite {
-			whiteCount++
+		if !allWhite {
+			content++
+			if content >= minContentPixels {
+				// Тайл содержит достаточно реальных пикселей — обрабатываем.
+				return false
+			}
 		}
 	}
-	validRatio := float64(validCount) / float64(width*height)
-	if validRatio < minValidRatio {
-		return true
-	}
-	if validCount == 0 {
-		return true
-	}
-	return float64(whiteCount)/float64(validCount) >= whiteRatio
+	return true
 }
 
 func thresholdMask(probs []float32, thr float32) []uint8 {
@@ -186,16 +212,6 @@ func removeSmallComponents(src []uint8, w, h int, minArea int) []uint8 {
 	return out
 }
 
-func toFloatMask(src []uint8) []float32 {
-	out := make([]float32, len(src))
-	for i, v := range src {
-		if v != 0 {
-			out[i] = 1.0
-		}
-	}
-	return out
-}
-
 func sigmoid(x float32) float32 {
 	return 1 / (1 + float32(math.Exp(float64(-x))))
 }
@@ -211,4 +227,55 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// fillSmallHoles fills zero-components fully surrounded by mask pixels.
+// If maxHoleArea <= 0, all internal holes are filled. Border-connected
+// background is never filled.
+func fillSmallHoles(src []uint8, w, h int, maxHoleArea int) []uint8 {
+	out := make([]uint8, len(src))
+	copy(out, src)
+	visited := make([]uint8, len(src))
+	queue := make([]int, 0, 1024)
+	component := make([]int, 0, 1024)
+	dirs := [][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
+	for i := 0; i < len(src); i++ {
+		if src[i] != 0 || visited[i] != 0 {
+			continue
+		}
+		queue = queue[:0]
+		component = component[:0]
+		queue = append(queue, i)
+		visited[i] = 1
+		touchesBorder := false
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			component = append(component, cur)
+			x := cur % w
+			y := cur / w
+			if x == 0 || y == 0 || x == w-1 || y == h-1 {
+				touchesBorder = true
+			}
+			for _, d := range dirs {
+				nx := x + d[0]
+				ny := y + d[1]
+				if nx < 0 || ny < 0 || nx >= w || ny >= h {
+					continue
+				}
+				ni := ny*w + nx
+				if src[ni] != 0 || visited[ni] != 0 {
+					continue
+				}
+				visited[ni] = 1
+				queue = append(queue, ni)
+			}
+		}
+		if !touchesBorder && (maxHoleArea <= 0 || len(component) <= maxHoleArea) {
+			for _, idx := range component {
+				out[idx] = 1
+			}
+		}
+	}
+	return out
 }

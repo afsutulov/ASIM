@@ -10,7 +10,8 @@ import (
 
 func printUsage(configPath string) {
 	fmt.Fprintln(os.Stderr, "ГБУ ПК \"Центр информационного развития Пермского края\". 2026 год")
-	fmt.Fprintln(os.Stderr, "Модуль поиска границ земельных участков по ортофотоснимкам\n")
+	fmt.Fprintln(os.Stderr, "Модуль поиска границ земельных участков по ортофотоснимкам")
+	fmt.Fprintln(os.Stderr)
 	fmt.Fprintf(os.Stderr, "Пример: ./ortophoto --config %s --model uchastki --poligon kray --start 2023 --end 2024 --out run1\n", configPath)
 }
 
@@ -113,7 +114,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Printf("ortophoto process started: model=%s output=%s years=%d..%d poligon=%s ortophoto=%s device=%s gpus=%v", spec.Name, *outputName, *startYear, *endYear, *poligon, cfg.Ortophoto, cfg.ORTDevice, cfg.ORTDeviceIDs)
+	log.Printf("ortophoto process started: model=%s output=%s years=%d..%d poligon=%s ortophoto=%s device=%s gpus=%v", spec.Name, *outputName, *startYear, *endYear, *poligon, cfg.Ortophoto, cfg.Compute.Device, cfg.Compute.GPUs)
 	zipPath, stats, err := RunProcess(ProcessConfig{
 		App:           cfg,
 		Spec:          spec,
