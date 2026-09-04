@@ -334,28 +334,46 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 	}
 	defer closeORTSessions(sessions)
 
-	// Внутренний накопитель всегда создаётся в метрической МСК-59. Зона выбирается
-	// один раз для всей задачи по центру поискового полигона WGS84 и больше не
-	// зависит от порядка/CRS входных GeoTIFF. Исходные растры НЕ перепроецируются:
-	// YOLO получает исходные пиксели, а векторные результаты приводятся к МСК-59.
+	// Результаты разделяются ПО CRS ИСХОДНЫХ СНИМКОВ, а не дублируются в обе
+	// системы координат. Снимки МСК-59 попадают только в MSK-накопитель;
+	// geographic/другие немсковские CRS — только в WGS84-накопитель.
+	// При этом метрические min_area_m2/simplify для любой исходной CRS считаются
+	// во временной МСК-59 выбранной зоны (см. Append...ByGroup).
 	shpDir := filepath.Join(workDir, "_internal_shp")
 	if err := os.MkdirAll(shpDir, 0o755); err != nil {
 		return "", stats, err
 	}
-	resultShp := filepath.Join(shpDir, safeName(cfg.Spec.Name)+".shp")
+	baseName := safeName(cfg.Spec.Name)
+	mskResultShp := filepath.Join(shpDir, baseName+"_msk.shp")
+	wgsResultShp := filepath.Join(shpDir, baseName+"_wgs.shp")
 	searchEnv := GeometryEnvelope(allowedGeom)
 	targetZone := MSK59ZoneForLongitude((searchEnv.MinX + searchEnv.MaxX) / 2)
-	targetSRS, err := NewMSK59SRS(targetZone)
+
+	mskSRS, err := NewMSK59SRS(targetZone)
 	if err != nil {
 		return "", stats, fmt.Errorf("create target MSK-59 zone %d: %w", targetZone, err)
 	}
-	if err := CreateEmptyAccumulatorShapefile(resultShp, targetSRS); err != nil {
-		DestroySRS(targetSRS)
+	if err := CreateEmptyAccumulatorShapefile(mskResultShp, mskSRS); err != nil {
+		DestroySRS(mskSRS)
 		return "", stats, err
 	}
-	DestroySRS(targetSRS)
-	accumulatorReady := true
-	log.Printf("ortophoto result CRS: MSK-59 zone=%d search_center_lon=%.6f", targetZone, (searchEnv.MinX+searchEnv.MaxX)/2)
+	DestroySRS(mskSRS)
+
+	wgsSRS, err := NewWGS84SRS()
+	if err != nil {
+		return "", stats, err
+	}
+	if err := CreateEmptyAccumulatorShapefile(wgsResultShp, wgsSRS); err != nil {
+		DestroySRS(wgsSRS)
+		return "", stats, err
+	}
+	DestroySRS(wgsSRS)
+
+	seenMSKSource := false
+	seenWGSSource := false
+	mskResultPolygons := 0
+	wgsResultPolygons := 0
+	log.Printf("ortophoto metric CRS for filters: MSK-59 zone=%d search_center_lon=%.6f", targetZone, (searchEnv.MinX+searchEnv.MaxX)/2)
 
 	processedDurSum := time.Duration(0)
 	for _, tif := range files {
@@ -372,6 +390,16 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 			continue
 		}
 
+		sourceGroup, sourceCRSLabel, err := ClassifySourceCRS(info.Proj)
+		if err != nil {
+			log.Printf("ortophoto CRS classify failed: file=%s error=%v", tif, err)
+			imgStat.Skipped = true
+			imgStat.SkipReason = "unsupported/unknown CRS: " + err.Error()
+			stats.Images = append(stats.Images, imgStat)
+			continue
+		}
+		log.Printf("ortophoto source CRS: file=%s group=%s detail=%s", filepath.Base(tif), sourceGroup, sourceCRSLabel)
+
 		intersects, err := RasterIntersectsAllowedWGS84(info.Geo, info.W, info.H, info.Proj, allowedGeom)
 		if err != nil {
 			log.Printf("ortophoto spatial prefilter failed, image will be processed: file=%s error=%v", tif, err)
@@ -384,6 +412,13 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 			stats.Images = append(stats.Images, imgStat)
 			log.Printf("ortophoto image skipped by spatial prefilter: file=%s path=%s", filepath.Base(tif), tif)
 			continue
+		}
+
+		switch sourceGroup {
+		case SourceCRSMSK59:
+			seenMSKSource = true
+		case SourceCRSWGS84:
+			seenWGSSource = true
 		}
 
 		img, err := ReadOrthophoto(tif, cfg.Spec.Normalization)
@@ -464,14 +499,23 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 		}
 		polyCount := 0
 		if nativeCount > 0 {
-			polyCount, err = AppendShapefileToAccumulatorFiltered(
-				clippedShp, resultShp, img.Proj, targetZone, cfg.Spec.MinAreaM2, cfg.Spec.Simplify,
+			dstAccumulator := wgsResultShp
+			if sourceGroup == SourceCRSMSK59 {
+				dstAccumulator = mskResultShp
+			}
+			polyCount, err = AppendShapefileToAccumulatorFilteredByGroup(
+				clippedShp, dstAccumulator, img.Proj, targetZone, sourceGroup, cfg.Spec.MinAreaM2, cfg.Spec.Simplify,
 			)
 			if err != nil {
 				return "", stats, err
 			}
+			if sourceGroup == SourceCRSMSK59 {
+				mskResultPolygons += polyCount
+			} else {
+				wgsResultPolygons += polyCount
+			}
 		}
-		log.Printf("ortophoto vectors: file=%s native_features=%d accepted_msk59_features=%d", filepath.Base(tif), nativeCount, polyCount)
+		log.Printf("ortophoto vectors: file=%s source_group=%s native_features=%d accepted_features=%d", filepath.Base(tif), sourceGroup, nativeCount, polyCount)
 		removeShapefileSet(fileShp)
 		removeShapefileSet(clippedShp)
 
@@ -491,43 +535,59 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 		stats.AvgPerImage = processedDurSum / time.Duration(stats.FilesProcessed)
 	}
 
-	_ = accumulatorReady // accumulator is created before processing; kept for compatibility with older stats flow.
+	// Публичные GeoJSON создаются только для тех групп CRS, которые реально
+	// присутствовали среди обрабатываемых снимков. Один и тот же результат не
+	// преобразуется и не копируется во второй файл: принадлежность определяется
+	// исключительно CRS исходного GeoTIFF.
+	generatedOutputs := make([]string, 0, 2)
+	if seenMSKSource {
+		mskGeoJSON := filepath.Join(workDir, fmt.Sprintf("%s_MSK59-%d.geojson", baseName, targetZone))
+		if err := ExportShapefileToGeoJSON(mskResultShp, mskGeoJSON); err != nil {
+			return "", stats, err
+		}
+		generatedOutputs = append(generatedOutputs, filepath.Base(mskGeoJSON))
+	}
+	if seenWGSSource {
+		wgsGeoJSON := filepath.Join(workDir, baseName+"_WGS84_EPSG4326.geojson")
+		// wgsResultShp уже содержит только результаты снимков WGS/geographic/
+		// немсковских projected CRS, нормализованные в EPSG:4326.
+		if err := ExportShapefileToGeoJSON(wgsResultShp, wgsGeoJSON); err != nil {
+			return "", stats, err
+		}
+		generatedOutputs = append(generatedOutputs, filepath.Base(wgsGeoJSON))
+	}
+	if !seenMSKSource && !seenWGSSource {
+		return "", stats, fmt.Errorf("no orthophoto source CRS groups were processed")
+	}
 
-	// Публичный результат: два GeoJSON.
-	// 1) МСК-59 выбранной зоны — для метрических/GIS/кадастровых операций.
-	//    Это GeoJSON 2008 с явным CRS (не RFC 7946).
-	// 2) WGS84 / EPSG:4326 — стандартный обменный/веб-вариант.
-	baseName := safeName(cfg.Spec.Name)
-	mskGeoJSON := filepath.Join(workDir, fmt.Sprintf("%s_MSK59-%d.geojson", baseName, targetZone))
-	wgsGeoJSON := filepath.Join(workDir, baseName+"_WGS84_EPSG4326.geojson")
-	if err := ExportShapefileToGeoJSON(resultShp, mskGeoJSON); err != nil {
-		return "", stats, err
-	}
-	if err := ConvertShapefileToGeoJSONMSK59(resultShp, wgsGeoJSON, targetZone); err != nil {
-		return "", stats, err
-	}
-	// Shapefile — только внутренний транспортный формат конвейера; пользователю
-	// он не нужен и в ZIP не включается.
+	// Shapefile остаётся только внутренним транспортным форматом.
 	if err := os.RemoveAll(shpDir); err != nil {
 		return "", stats, err
 	}
+	log.Printf("ortophoto result groups: msk_source=%t msk_polygons=%d wgs_source=%t wgs_polygons=%d outputs=%v", seenMSKSource, mskResultPolygons, seenWGSSource, wgsResultPolygons, generatedOutputs)
 
 	manifest := map[string]any{
-		"model":           cfg.Spec.Name,
-		"start_year":      cfg.StartYear,
-		"end_year":        cfg.EndYear,
-		"poligon":         cfg.SearchPolygon,
-		"files_seen":      stats.FilesSeen,
-		"files_processed": stats.FilesProcessed,
-		"model_runs":      stats.ModelRuns,
-		"result_polygons": stats.ResultPolygons,
-		"total_duration":  stats.TotalDuration.String(),
-		"avg_per_image":   stats.AvgPerImage.String(),
-		"images":          stats.Images,
+		"model":               cfg.Spec.Name,
+		"start_year":          cfg.StartYear,
+		"end_year":            cfg.EndYear,
+		"poligon":             cfg.SearchPolygon,
+		"files_seen":          stats.FilesSeen,
+		"files_processed":     stats.FilesProcessed,
+		"model_runs":          stats.ModelRuns,
+		"result_polygons":     stats.ResultPolygons,
+		"msk_result_polygons": mskResultPolygons,
+		"wgs_result_polygons": wgsResultPolygons,
+		"has_msk_sources":     seenMSKSource,
+		"has_wgs_sources":     seenWGSSource,
+		"output_files":        generatedOutputs,
+		"total_duration":      stats.TotalDuration.String(),
+		"avg_per_image":       stats.AvgPerImage.String(),
+		"images":              stats.Images,
 	}
 	// result.json пишем внутри workDir для удобства отладки (он будет удалён
 	// вместе с workDir по defer), но НЕ включаем его в итоговый zip-архив —
-	// в архиве должны быть только два публичных GeoJSON (и debug CSV, если включён dump_candidates).
+	// в архиве находятся только GeoJSON тех CRS-групп, которые присутствовали
+	// во входных снимках (и debug CSV, если включён dump_candidates).
 	manifestPath := filepath.Join(workDir, "result.json")
 	blob, _ := json.MarshalIndent(manifest, "", "  ")
 	if err := os.WriteFile(manifestPath, blob, 0o644); err != nil {

@@ -12,6 +12,7 @@ import "C"
 
 import (
 	"fmt"
+	"strings"
 	"unsafe"
 )
 
@@ -60,4 +61,59 @@ ABRIDGEDTRANSFORMATION["Transformation from Pulkovo 1942 ГОСТ to WGS84",METH
 	}
 	C._set_traditional_gis_order_msk(srs)
 	return srs, nil
+}
+
+// SourceCRSGroup определяет, в какой публичный набор результата должен попасть
+// результат конкретного исходного GeoTIFF. ВАЖНО: это классификация ИСТОЧНИКА,
+// а не желаемой системы координат общего задания.
+type SourceCRSGroup string
+
+const (
+	SourceCRSMSK59 SourceCRSGroup = "msk59"
+	SourceCRSWGS84 SourceCRSGroup = "wgs84"
+)
+
+// NewWGS84SRS создаёт EPSG:4326 с традиционным GIS-порядком осей lon,lat.
+func NewWGS84SRS() (C.OGRSpatialReferenceH, error) {
+	srs := C.OSRNewSpatialReference(nil)
+	if srs == nil {
+		return nil, fmt.Errorf("OSRNewSpatialReference WGS84 failed")
+	}
+	if C.OSRImportFromEPSG(srs, 4326) != 0 {
+		C.OSRDestroySpatialReference(srs)
+		return nil, fmt.Errorf("OSRImportFromEPSG(4326) failed")
+	}
+	C._set_traditional_gis_order_msk(srs)
+	return srs, nil
+}
+
+// ClassifySourceCRS разделяет входные снимки на две группы результата:
+//   - МСК-59 -> результат остаётся в МСК-59;
+//   - geographic CRS (в т.ч. EPSG:4326) -> результат идёт в WGS84/EPSG:4326.
+//
+// Для других projected CRS (например UTM) используем WGS84-группу: такие
+// координаты не являются МСК-59, а публичный международный результат всё равно
+// нормализуется в EPSG:4326. Это позволяет принимать материалы разных подрядчиков.
+func ClassifySourceCRS(wkt string) (SourceCRSGroup, string, error) {
+	if strings.TrimSpace(wkt) == "" {
+		return "", "", fmt.Errorf("empty raster CRS")
+	}
+	srs, err := projSRSFromWKT(wkt)
+	if err != nil {
+		return "", "", err
+	}
+	defer C.OSRDestroySpatialReference(srs)
+
+	lower := strings.ToLower(wkt)
+	isMSK59 := strings.Contains(lower, "мск 59") ||
+		strings.Contains(lower, "мск-59") ||
+		strings.Contains(lower, "msk 59") ||
+		strings.Contains(lower, "msk-59")
+	if isMSK59 {
+		return SourceCRSMSK59, "MSK-59", nil
+	}
+	if C.OSRIsGeographic(srs) != 0 {
+		return SourceCRSWGS84, "geographic->WGS84", nil
+	}
+	return SourceCRSWGS84, "projected-non-MSK59->WGS84", nil
 }

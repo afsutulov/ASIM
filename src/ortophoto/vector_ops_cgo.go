@@ -427,11 +427,16 @@ func ReadLayerSRS(path string) (C.OGRSpatialReferenceH, error) {
 	return C._clone_srs(lsrs), nil
 }
 
-// AppendShapefileToAccumulatorFiltered переносит геометрии из native CRS снимка
-// в фиксированную для задания зону МСК-59. После трансформации применяет
-// метрические min_area_m2 и simplify. Полный WKT исходного GeoTIFF передаётся
-// отдельно, чтобы не терять BOUNDCRS/датум-трансформацию через Shapefile .prj.
-func AppendShapefileToAccumulatorFiltered(srcShp string, outShp string, sourceWKT string, targetMSK59Zone int, minAreaM2, simplifyMetres float64) (int, error) {
+// AppendShapefileToAccumulatorFilteredByGroup переносит геометрии из native CRS
+// снимка во внутренний накопитель, соответствующий ГРУППЕ ИСХОДНОЙ CRS.
+//
+// Метрические операции (min_area_m2 и simplify) всегда выполняются во
+// временной целевой МСК-59 выбранной зоны. После них геометрия либо остаётся в
+// МСК-59 (для снимков МСК-59), либо преобразуется в WGS84/EPSG:4326 (для
+// снимков с geographic/другой немсковской CRS). Таким образом метрические
+// фильтры корректны для любых входных GeoTIFF, но результат не дублируется
+// одновременно в двух публичных системах координат.
+func AppendShapefileToAccumulatorFilteredByGroup(srcShp string, outShp string, sourceWKT string, targetMSK59Zone int, group SourceCRSGroup, minAreaM2, simplifyMetres float64) (int, error) {
 	C._gdal_init_vector_once()
 
 	srcCP := C.CString(srcShp)
@@ -459,8 +464,8 @@ func AppendShapefileToAccumulatorFiltered(srcShp string, outShp string, sourceWK
 	srcDNIndex := C.OGR_FD_GetFieldIndex(C.OGR_L_GetLayerDefn(srcLayer), fdDN)
 	dstDNIndex := C.OGR_FD_GetFieldIndex(dstDefn, fdDN)
 
-	// Используем полный WKT ИСХОДНОГО GeoTIFF, если он передан. Shapefile .prj
-	// может потерять BOUNDCRS/параметры датум-трансформации МСК-59 -> WGS84.
+	// Используем полный WKT исходного GeoTIFF, чтобы не потерять BOUNDCRS и
+	// параметры датум-трансформации через Shapefile .prj.
 	var srcSRS C.OGRSpatialReferenceH
 	if strings.TrimSpace(sourceWKT) != "" {
 		parsed, perr := projSRSFromWKT(sourceWKT)
@@ -474,15 +479,35 @@ func AppendShapefileToAccumulatorFiltered(srcShp string, outShp string, sourceWK
 		C._set_traditional_gis_order(srcSRS)
 		defer C.OSRDestroySpatialReference(srcSRS)
 	}
-	// .prj Shapefile не сохраняет BOUNDCRS полностью. Для точной трансформации
-	// используем полное определение целевой МСК-59, а не SRS, перечитанный из .prj.
-	dstSRS, derr := NewMSK59SRS(targetMSK59Zone)
+
+	// metricSRS используется только как единая метрическая рабочая система для
+	// area/simplify. Для WGS84-группы после фильтра геометрия переводится обратно
+	// в EPSG:4326 перед записью в накопитель.
+	metricSRS, derr := NewMSK59SRS(targetMSK59Zone)
 	if derr != nil {
 		return 0, derr
 	}
-	defer C.OSRDestroySpatialReference(dstSRS)
-	accepted := 0
+	defer C.OSRDestroySpatialReference(metricSRS)
 
+	var outputSRS C.OGRSpatialReferenceH
+	switch group {
+	case SourceCRSMSK59:
+		outputSRS = C.OSRClone(metricSRS)
+		if outputSRS == nil {
+			return 0, fmt.Errorf("clone MSK-59 output CRS failed")
+		}
+		C._set_traditional_gis_order(outputSRS)
+	case SourceCRSWGS84:
+		outputSRS, derr = NewWGS84SRS()
+		if derr != nil {
+			return 0, derr
+		}
+	default:
+		return 0, fmt.Errorf("unsupported source CRS group: %q", group)
+	}
+	defer C.OSRDestroySpatialReference(outputSRS)
+
+	accepted := 0
 	C.OGR_L_ResetReading(srcLayer)
 	for {
 		feat := C.OGR_L_GetNextFeature(srcLayer)
@@ -494,38 +519,52 @@ func AppendShapefileToAccumulatorFiltered(srcShp string, outShp string, sourceWK
 			C.OGR_F_Destroy(feat)
 			continue
 		}
-		tg, err := transformGeometryToSRS(geom, srcSRS, dstSRS)
-		if err != nil || tg == nil || GeometryIsEmpty(tg) {
-			if tg != nil {
-				DestroyGeometry(tg)
+
+		metricGeom, err := transformGeometryToSRS(geom, srcSRS, metricSRS)
+		if err != nil || metricGeom == nil || GeometryIsEmpty(metricGeom) {
+			if metricGeom != nil {
+				DestroyGeometry(metricGeom)
 			}
 			C.OGR_F_Destroy(feat)
 			continue
 		}
 
-		// ВАЖНО: tg уже находится в целевой МСК-59, поэтому OGR_G_Area
-		// возвращает м², а simplifyMetres действительно измеряется в метрах
-		// независимо от исходной CRS GeoTIFF (WGS84, МСК, UTM и т.п.).
-		if minAreaM2 > 0 && float64(C.OGR_G_Area(tg)) < minAreaM2 {
-			DestroyGeometry(tg)
+		if minAreaM2 > 0 && float64(C.OGR_G_Area(metricGeom)) < minAreaM2 {
+			DestroyGeometry(metricGeom)
 			C.OGR_F_Destroy(feat)
 			continue
 		}
 		if simplifyMetres > 0 {
-			sg := C.OGR_G_SimplifyPreserveTopology(tg, C.double(simplifyMetres))
+			sg := C.OGR_G_SimplifyPreserveTopology(metricGeom, C.double(simplifyMetres))
 			if sg != nil {
-				DestroyGeometry(tg)
-				tg = sg
+				DestroyGeometry(metricGeom)
+				metricGeom = sg
 			}
 		}
-		normalized := toMultiPolygon(tg)
-		if normalized != tg {
-			DestroyGeometry(tg)
-			tg = normalized
+
+		outGeom := metricGeom
+		if group == SourceCRSWGS84 {
+			wg, terr := transformGeometryToSRS(metricGeom, metricSRS, outputSRS)
+			DestroyGeometry(metricGeom)
+			metricGeom = nil
+			if terr != nil || wg == nil || GeometryIsEmpty(wg) {
+				if wg != nil {
+					DestroyGeometry(wg)
+				}
+				C.OGR_F_Destroy(feat)
+				continue
+			}
+			outGeom = wg
+		}
+
+		normalized := toMultiPolygon(outGeom)
+		if normalized != outGeom {
+			DestroyGeometry(outGeom)
+			outGeom = normalized
 		}
 		outFeat := C.OGR_F_Create(dstDefn)
 		if outFeat != nil {
-			if C.OGR_F_SetGeometry(outFeat, tg) == 0 {
+			if C.OGR_F_SetGeometry(outFeat, outGeom) == 0 {
 				if srcDNIndex >= 0 && dstDNIndex >= 0 {
 					C.OGR_F_SetFieldInteger(outFeat, dstDNIndex, C.OGR_F_GetFieldAsInteger(feat, srcDNIndex))
 				}
@@ -535,11 +574,17 @@ func AppendShapefileToAccumulatorFiltered(srcShp string, outShp string, sourceWK
 			}
 			C.OGR_F_Destroy(outFeat)
 		}
-		DestroyGeometry(tg)
+		DestroyGeometry(outGeom)
 		C.OGR_F_Destroy(feat)
 	}
 	C.GDALFlushCache(dstDS)
 	return accepted, nil
+}
+
+// AppendShapefileToAccumulatorFiltered сохраняет прежний API: результат
+// переводится в выбранную МСК-59. Новый pipeline использует функцию ByGroup.
+func AppendShapefileToAccumulatorFiltered(srcShp string, outShp string, sourceWKT string, targetMSK59Zone int, minAreaM2, simplifyMetres float64) (int, error) {
+	return AppendShapefileToAccumulatorFilteredByGroup(srcShp, outShp, sourceWKT, targetMSK59Zone, SourceCRSMSK59, minAreaM2, simplifyMetres)
 }
 
 // AppendShapefileToAccumulator сохраняет прежний API для вспомогательного кода.
