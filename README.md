@@ -1,93 +1,413 @@
-# src
+# ASIM — Аналитическая система интеллектуального мониторинга
 
+**ASIM (Analytical System of Intelligent Monitoring / Аналитическая система интеллектуального мониторинга)** — прикладная GIS/AI-система для автоматизированного поиска объектов и изменений на спутниковых снимках Sentinel-2 и ортофотоснимках, полученных с БПЛА.
 
+Репозиторий: https://github.com/afsutulov/asim
 
-## Getting started
+Проект объединяет загрузку и индексирование спутниковых данных, построение мозаик, GPU-инференс ONNX-моделей, обработку ортофото моделями YOLO11-seg, пространственную фильтрацию результатов, очередь заданий и веб-интерфейс.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+> Проект ориентирован на эксплуатацию в Linux-среде с GDAL, ONNX Runtime и NVIDIA GPU. Конкретные модели `.onnx`, рабочие наборы спутниковых/БПЛА-снимков и эксплуатационные данные могут не входить в Git-репозиторий из-за размера и/или ограничений на распространение.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## Возможности
 
-## Add your files
+ASIM поддерживает два основных конвейера анализа:
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+- **Sentinel-2** — обработка L1C/L2A, выбор спектральных каналов, тайловый inference ONNX-моделей, объединение масок и формирование векторных результатов.
+- **БПЛА / ортофото** — чтение GeoTIFF, тайловый inference YOLO11-seg, NMS, восстановление instance masks, объединение классов, морфологическая постобработка, полигонизация, пространственное ограничение зоной поиска и экспорт результата.
 
+В поставляемом `config.json` присутствуют конфигурации задач для поиска/анализа различных типов объектов, включая борщевик Сосновского, гари, карьеры, свалки, пашню, ветровалы, здания и другие классы. Набор реально доступных задач определяется установленными ONNX-моделями и конфигурацией конкретного развертывания.
+
+## Архитектура
+
+```text
+                         ┌─────────────────────┐
+                         │     Web / Flask     │
+                         │       app.py        │
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │ prosessing.json     │
+                         │   очередь заданий   │
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │      task (Go)      │
+                         └───────┬─────┬───────┘
+                                 │     │
+                      Sentinel-2 │     │ Orthophoto
+                                 ▼     ▼
+                       ┌───────────┐ ┌─────────────┐
+                       │ sentinel  │ │  ortophoto  │
+                       │ ONNX/UNet │ │ YOLO11-seg  │
+                       └─────┬─────┘ └──────┬──────┘
+                             │              │
+                             └──────┬───────┘
+                                    ▼
+                         ┌─────────────────────┐
+                         │ GeoJSON / ZIP       │
+                         │ results.json        │
+                         └─────────────────────┘
 ```
-cd existing_repo
-git remote add origin https://repo.permkrai.ru/mirs/asim/src.git
-git branch -M main
-git push -uf origin main
+
+Дополнительные модули:
+
+| Каталог | Назначение |
+|---|---|
+| `src/downloader` | загрузка спутниковых данных |
+| `src/cron` | периодические операции/обновление данных |
+| `src/mosaic` | подготовка мозаик Sentinel-2 |
+| `src/sentinel` | inference и постобработка спутниковых моделей |
+| `src/ortophoto` | inference YOLO11-seg по БПЛА GeoTIFF |
+| `src/task` | последовательный исполнитель очереди заданий |
+| `app.py` | веб-приложение и API |
+| `templates/`, `static/` | интерфейс веб-приложения |
+| `poligons/` | GeoJSON территорий/ограничений поиска |
+| `data/` | конфигурация и служебные JSON-файлы |
+| `deploy/` | systemd units и эксплуатационные файлы |
+
+## Работа с системами координат ортофото
+
+Ортофотоснимки в ASIM могут поступать от разных организаций и **не обязаны иметь одинаковую CRS**. Например, один GeoTIFF может находиться в МСК-59, другой — в WGS84/EPSG:4326, третий — в иной корректно описанной GDAL/PROJ системе координат.
+
+ASIM не перепроецирует исходное RGB-изображение перед нейросетевым inference. Это принципиально: модель получает исходные пиксели без дополнительного resampling.
+
+Конвейер устроен так:
+
+```text
+GeoTIFF в любой поддерживаемой CRS
+        ↓
+YOLO11-seg по исходным пикселям
+        ↓
+растровая маска в native CRS GeoTIFF
+        ↓
+GDALPolygonize
+        ↓
+clipping в native CRS
+        ↓
+репроекция в целевую зону МСК-59
+        ↓
+min_area_m2 / simplify в МЕТРАХ
+        ↓
+единый векторный accumulator
+        ↓
+┌──────────────────────────┬───────────────────────────┐
+│ *_MSK59-N.geojson        │ *_WGS84_EPSG4326.geojson │
+└──────────────────────────┴───────────────────────────┘
 ```
 
-## Integrate with your tools
+Целевая зона МСК-59 определяется один раз для задания по долготе центра выбранного поискового полигона. Используются зоны с центральными меридианами 53.55°, 56.55° и 59.55°. Поэтому итоговая CRS не зависит от порядка входных файлов и от системы координат конкретного подрядчика.
 
-- [ ] [Set up project integrations](https://repo.permkrai.ru/mirs/asim/src/-/settings/integrations)
+Метрические операции (`min_area_m2`, `simplify`) выполняются **только после преобразования геометрии в МСК-59**. Это устраняет ошибку, при которой площадь геометрии EPSG:4326 могла ошибочно сравниваться с квадратными метрами.
 
-## Collaborate with your team
+Для `class_merge_rules.distance_m` ASIM также учитывает geographic CRS: размер пикселя GeoTIFF в градусах пересчитывается в приблизительный локальный размер в метрах по широте центра снимка.
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+### Форматы результата БПЛА
 
-## Test and Deploy
+В итоговый ZIP помещаются два GeoJSON:
 
-Use the built-in continuous integration in GitLab.
+```text
+<model>_MSK59-<zone>.geojson
+<model>_WGS84_EPSG4326.geojson
+```
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+Первый предназначен прежде всего для локальных GIS/кадастровых операций в МСК-59. Он использует GeoJSON 2008 с информацией о CRS и сознательно не является RFC 7946 GeoJSON, поскольку RFC 7946 требует WGS84.
 
-***
+Второй содержит ту же выборку, репроецированную в WGS84/EPSG:4326, и предназначен для обмена, веб-карт и ПО, ожидающего стандартные географические координаты. В соответствии с RFC 7946 именно WGS84-вариант следует использовать там, где требуется строго стандартный GeoJSON.
 
-# Editing this README
+## Требования
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+Основные компоненты:
 
-## Suggestions for a good README
+- Linux;
+- Go **1.22+** для Go-модулей;
+- Python **3.10+** для веб-приложения;
+- GDAL/OGR с development headers и `pkg-config`;
+- PROJ (обычно устанавливается как зависимость GDAL);
+- ONNX Runtime;
+- NVIDIA Driver + CUDA/cuDNN для GPU-инференса;
+- Python-пакеты из `requirements.txt`.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+Go-модули `sentinel` и `ortophoto` используют:
 
-## Name
-Choose a self-explaining name for your project.
+- `github.com/lukeroth/gdal`;
+- `github.com/yalue/onnxruntime_go`.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+Для CPU-развертывания в `config.json` можно выбрать `compute.device = "cpu"`; для CUDA — `"gpu"` и список GPU.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## Структура данных
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+Типовая эксплуатационная структура соответствует путям из `data/config.json`:
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+```text
+/opt/asim/
+├── data/
+├── models/
+├── poligons/
+├── sentinel
+├── ortophoto
+└── task
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+/mnt/share/newest/
+├── Sentinel2_L1C/
+├── Sentinel2_L2A/
+└── Ortophoto/
+    ├── 2025/
+    └── 2026/
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+/mnt/share/results/
+└── <task-uuid>.zip
+```
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+Пути полностью конфигурируются и не обязаны совпадать с примером.
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+## Конфигурация
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+Основной файл — `data/config.json`.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+Ключевые глобальные параметры:
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+```json
+{
+  "logs": "/var/log/asim",
+  "path": "/opt/asim",
+  "sentinel": "/mnt/share/newest/Sentinel2_L1C",
+  "sentinel2A": "/mnt/share/newest/Sentinel2_L2A",
+  "ortophoto": "/mnt/share/newest/Ortophoto",
+  "tmp": "/mnt/data",
+  "results_path": "/mnt/share/results",
+  "models_path": "/opt/asim/models",
+  "compute": {
+    "device": "gpu",
+    "gpus": [0, 1]
+  }
+}
+```
 
-## License
-For open source projects, say how it is licensed.
+### Пример YOLO11-seg модели БПЛА
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+```json
+"hogweed_bpla": {
+  "description": "Зарастание Борщевиком Сосновского (БПЛА)",
+  "onnx_file": "hogweed_bpla.onnx",
+  "preprocess": "ortophoto",
+  "num_classes": 1,
+  "classes": [0],
+  "tile": 1536,
+  "bound": 128,
+  "normalization": "fixed",
+  "threshold": 0.25,
+  "class_thresholds": {"0": 0.25},
+  "nms_threshold": 0.45,
+  "mask_threshold": 0.5,
+  "yolo_mask_dim": 32,
+  "yolo_proto_stride": 4,
+  "input_name": "images",
+  "output_names": ["output0", "output1"],
+  "min_area": 10,
+  "min_area_m2": 1,
+  "simplify": 0
+}
+```
+
+Основные параметры ortophoto-модели:
+
+| Параметр | Значение |
+|---|---|
+| `tile` | размер входного тайла модели |
+| `bound` | перекрытие/защитная область тайлов |
+| `normalization` | `fixed`, `minmax` или `none` |
+| `threshold` | общий confidence threshold |
+| `class_thresholds` | пороги отдельных классов |
+| `nms_threshold` | IoU-порог NMS |
+| `mask_threshold` | порог бинаризации YOLO mask |
+| `min_area` | минимальная компонента маски в пикселях |
+| `min_area_m2` | минимальная площадь итогового полигона в м²; явный `0` отключает фильтр |
+| `simplify` | допуск упрощения геометрии в метрах |
+| `class_merge_rules` | правила объединения классов по расстоянию в метрах |
+| `skip_empty_tiles` | пропуск практически пустых/nodata тайлов |
+| `dump_candidates` | диагностический CSV кандидатов YOLO |
+
+`normalization` должна соответствовать preprocessing, использованному при обучении модели. Для обычных 8-bit RGB YOLO-моделей, обученных на `pixel/255`, применяется `fixed`.
+
+## Сборка Go-модулей
+
+Каждый компонент является отдельным Go-модулем.
+
+Пример:
+
+```bash
+cd src/ortophoto
+go build -o /opt/asim/ortophoto .
+
+cd ../sentinel
+go build -o /opt/asim/sentinel .
+
+cd ../task
+go build -o /opt/asim/task .
+```
+
+Аналогично собираются `cron`, `downloader` и `mosaic`.
+
+Перед сборкой `ortophoto`/`sentinel` должны быть доступны GDAL headers/libraries и ONNX Runtime shared library. На изолированном сервере Go dependencies необходимо заранее загрузить в module cache или vendor-каталог.
+
+## Запуск ortophoto вручную
+
+```bash
+/opt/asim/ortophoto \
+  --config /opt/asim/data/config.json \
+  --model hogweed_bpla \
+  --poligon permsky \
+  --start 2026 \
+  --end 2026 \
+  --out test-hogweed
+```
+
+Результат создаётся в `results_path`:
+
+```text
+test-hogweed.zip
+```
+
+В лог выводятся, в частности:
+
+```text
+ortophoto result CRS: MSK-59 zone=2 ...
+ortophoto inference: ... tiles=... detected_pixels=... final_pixels=...
+ortophoto vectors: ... native_features=... accepted_msk59_features=...
+ortophoto completed: ... result_polygons=...
+```
+
+Эти строки полезны для разделения проблем inference и GIS-постобработки.
+
+## Очередь заданий
+
+`src/task` раз в 60 секунд проверяет `prosessing.json`, выбирает старейшее задание и запускает нужный worker по полю `preprocess`.
+
+```bash
+/opt/asim/task --run --config /opt/asim/data/config.json
+```
+
+После успешного создания ZIP задача удаляется из очереди и переносится в `results.json`.
+
+## Веб-интерфейс
+
+Веб-часть написана на Flask.
+
+Установка Python-зависимостей:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Запуск в режиме разработки:
+
+```bash
+python app.py
+```
+
+Веб-интерфейс предоставляет авторизацию, создание и удаление заданий, просмотр очереди и результатов, скачивание ZIP, управление полигонами поиска, просмотр логов и файлов спутниковых данных. Доступность отдельных действий зависит от группы пользователя.
+
+Для production рекомендуется запускать приложение как systemd service / WSGI deployment в соответствии с политикой конкретного сервера. В `deploy/` находятся используемые проектом unit-файлы.
+
+## Полигоны поиска
+
+`data/poligons.json` содержит реестр доступных территорий, а каталог `poligons/` — соответствующие GeoJSON.
+
+Полигон поиска используется для:
+
+1. предварительного исключения GeoTIFF, не пересекающих территорию;
+2. clipping найденных объектов;
+3. ограничения анализа административной или пользовательской территорией.
+
+Пользовательские GeoJSON могут загружаться через веб-интерфейс при наличии соответствующих прав.
+
+## GPU и несколько видеокарт
+
+Пример:
+
+```json
+"compute": {
+  "device": "gpu",
+  "gpus": [0, 1]
+}
+```
+
+Ortophoto-модуль создаёт ONNX Runtime sessions для указанных GPU и распределяет inference между ними. Для CPU:
+
+```json
+"compute": {
+  "device": "cpu",
+  "gpus": []
+}
+```
+
+Конкретная производительность зависит от модели, размера тайла, разрешения растра, числа GPU и скорости хранилища.
+
+## Диагностика ortophoto
+
+Если модель не формирует полигоны, проверяйте цепочку поэтапно:
+
+1. `model_runs` — запускалась ли модель;
+2. `detected_pixels` — появились ли candidate masks;
+3. `final_pixels` — остались ли пиксели после постобработки;
+4. `native_features` — создал ли GDALPolygonize геометрии;
+5. `accepted_msk59_features` — сколько геометрий прошло репроекцию и метрические фильтры;
+6. итоговый `result_polygons`.
+
+Для детальной диагностики можно включить `dump_candidates` в модели. CSV содержит координаты кандидата, bbox, confidence, class, заполнение маски и решение reject-фильтров.
+
+## Тесты
+
+В модулях присутствуют unit-тесты отдельных алгоритмов ortophoto:
+
+```bash
+cd src/ortophoto
+go test ./...
+```
+
+Для полного теста необходимы Go dependencies и системные библиотеки GDAL. Интеграционные тесты inference дополнительно требуют ONNX Runtime и соответствующие модели.
+
+## Безопасность и эксплуатация
+
+- Не публикуйте production `users.json` с реальными учётными данными.
+- Не храните секреты и пароли непосредственно в публичном `config.json`.
+- Проверяйте права на `results_path`, `logs`, `tmp` и каталоги исходных данных.
+- Большие `.onnx`, GeoTIFF и спутниковые архивы лучше хранить вне обычной истории Git; при необходимости используйте Git LFS или внешнее хранилище.
+- Перед публикацией репозитория проверьте историю Git на наличие секретов и служебных данных.
+
+## Особенности GeoJSON
+
+ASIM формирует WGS84 GeoJSON для стандартного обмена. Согласно RFC 7946, GeoJSON использует WGS84/географические координаты. Файл МСК-59 сохраняется отдельно как GeoJSON 2008 с CRS для практической совместимости с GIS-сценариями проекта. Если сторонняя система поддерживает только RFC 7946, используйте файл `*_WGS84_EPSG4326.geojson`.
+
+## Ограничения
+
+- Качество результата определяется качеством и репрезентативностью обученной модели.
+- Разные камеры, сезоны, высота полёта, GSD, освещение и обработка ортофото могут требовать дополнительного обучения модели.
+- Автоматический выбор МСК-59 ориентирован на территорию Пермского края и три используемые проектом зоны.
+- Для задач, охватывающих очень большую территорию сразу через несколько зон, следует оценивать проекционные искажения и при необходимости делить обработку по территориям/зонам.
+- Векторный результат нейросетевой сегментации не следует считать кадастровым измерением без профильной проверки.
+
+## Разработка
+
+При изменении ortophoto-пайплайна желательно сохранять следующие инварианты:
+
+- нейросеть работает с исходными пикселями, а не с перепроецированным RGB;
+- CRS каждого GeoTIFF читается из самого файла;
+- метрические фильтры применяются только в метрической CRS;
+- результат задания не зависит от порядка входных GeoTIFF;
+- WGS84 создаётся как производный экспорт из единого метрического результата;
+- явное значение `0` у отключаемых фильтров не должно заменяться default-значением.
+
+## Лицензия
+
+В текущем репозитории отдельный файл лицензии не определён. Перед публичным распространением проекта рекомендуется добавить `LICENSE` и явно указать условия использования, модификации и распространения исходного кода.
+
+## Обратная связь
+
+Ошибки и предложения по развитию проекта рекомендуется оформлять через GitHub Issues репозитория:
+
+https://github.com/afsutulov/asim/issues
