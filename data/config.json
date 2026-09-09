@@ -630,21 +630,21 @@
       "classes": [0],
 
       "tile": 1536,
-      "bound": 128,
+      "bound": 256,
 
       "normalization": "fixed",
 
-      "threshold": 0.25,
+      "threshold": 0.15,
 
       "class_thresholds": {
-        "0": 0.25
+        "0": 0.15
       },
 
-      "nms_threshold": 0.45,
+      "nms_threshold": 1.0,
       "agnostic_nms": false,
       "exclusive_classes": true,
 
-      "mask_threshold": 0.5,
+      "mask_threshold": 0.3,
 
       "yolo_mask_dim": 32,
       "yolo_proto_stride": 4,
