@@ -103,54 +103,105 @@ func applyValidMask(a []uint8, valid []uint8) {
 	}
 }
 
-func dilateMask(src []uint8, w, h, radius int) []uint8 {
+// dilateMask и erodeMask используют РАЗДЕЛИМУЮ реализацию: квадратный
+// структурный элемент (2r+1)x(2r+1) раскладывается в одномерное окно по X и
+// затем по Y, а само окно считается по префиксным суммам за O(1) на пиксель.
+// Результат математически тождественен прежней наивной реализации (включая
+// обрезку окна на границах растра), но стоимость перестаёт зависеть от
+// радиуса: morph_close с радиусом 24-48 px становится применимым на листе
+// 20000x20000, тогда как прежняя версия была O(r^2) на пиксель.
+//
+// Это нужно для «ковровых» классов: борщевик детектируется отдельными
+// очагами, и чтобы получить полигон зоны зарастания, очаги надо сомкнуть
+// морфологией на масштабе расстояния между ними.
+
+// dilate1D выполняет одномерную дилатацию бинарной строки/столбца по окну
+// [i-radius, i+radius], обрезанному границами.
+func dilate1D(src []uint8, n, stride, radius int, dst []uint8, prefix []int32) {
+	prefix[0] = 0
+	for i := 0; i < n; i++ {
+		v := int32(0)
+		if src[i*stride] != 0 {
+			v = 1
+		}
+		prefix[i+1] = prefix[i] + v
+	}
+	for i := 0; i < n; i++ {
+		lo := i - radius
+		if lo < 0 {
+			lo = 0
+		}
+		hi := i + radius
+		if hi > n-1 {
+			hi = n - 1
+		}
+		if prefix[hi+1]-prefix[lo] > 0 {
+			dst[i*stride] = 1
+		} else {
+			dst[i*stride] = 0
+		}
+	}
+}
+
+// erode1D — одномерная эрозия: пиксель остаётся, только если в окне нет нулей.
+func erode1D(src []uint8, n, stride, radius int, dst []uint8, prefix []int32) {
+	prefix[0] = 0
+	for i := 0; i < n; i++ {
+		v := int32(0)
+		if src[i*stride] != 0 {
+			v = 1
+		}
+		prefix[i+1] = prefix[i] + v
+	}
+	for i := 0; i < n; i++ {
+		lo := i - radius
+		if lo < 0 {
+			lo = 0
+		}
+		hi := i + radius
+		if hi > n-1 {
+			hi = n - 1
+		}
+		if prefix[hi+1]-prefix[lo] == int32(hi-lo+1) {
+			dst[i*stride] = 1
+		} else {
+			dst[i*stride] = 0
+		}
+	}
+}
+
+func separableMorph(src []uint8, w, h, radius int, dilate bool) []uint8 {
 	if radius <= 0 {
 		out := make([]uint8, len(src))
 		copy(out, src)
 		return out
 	}
+	op := erode1D
+	if dilate {
+		op = dilate1D
+	}
+	tmp := make([]uint8, len(src))
 	dst := make([]uint8, len(src))
+	maxN := w
+	if h > maxN {
+		maxN = h
+	}
+	prefix := make([]int32, maxN+1)
 	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			val := uint8(0)
-			for yy := max(0, y-radius); yy <= min(h-1, y+radius); yy++ {
-				for xx := max(0, x-radius); xx <= min(w-1, x+radius); xx++ {
-					if src[yy*w+xx] != 0 {
-						val = 1
-						goto done
-					}
-				}
-			}
-		done:
-			dst[y*w+x] = val
-		}
+		op(src[y*w:], w, 1, radius, tmp[y*w:], prefix)
+	}
+	for x := 0; x < w; x++ {
+		op(tmp[x:], h, w, radius, dst[x:], prefix)
 	}
 	return dst
 }
 
+func dilateMask(src []uint8, w, h, radius int) []uint8 {
+	return separableMorph(src, w, h, radius, true)
+}
+
 func erodeMask(src []uint8, w, h, radius int) []uint8 {
-	if radius <= 0 {
-		out := make([]uint8, len(src))
-		copy(out, src)
-		return out
-	}
-	dst := make([]uint8, len(src))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			val := uint8(1)
-			for yy := max(0, y-radius); yy <= min(h-1, y+radius); yy++ {
-				for xx := max(0, x-radius); xx <= min(w-1, x+radius); xx++ {
-					if src[yy*w+xx] == 0 {
-						val = 0
-						goto done
-					}
-				}
-			}
-		done:
-			dst[y*w+x] = val
-		}
-	}
-	return dst
+	return separableMorph(src, w, h, radius, false)
 }
 
 func openMask(src []uint8, w, h, radius int) []uint8 {

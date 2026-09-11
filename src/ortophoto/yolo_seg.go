@@ -181,8 +181,35 @@ type candidateRecord struct {
 	rawW, rawH     float32
 	score          float32
 	classID        int
-	fill           float32 // заполнение бокса маской (rectangularity)
+	fill           float32 // заполнение маской её собственного bbox (rectangularity)
+	winW, winH     int     // окно чтения маски (bbox + mask_bbox_margin, обрезанное тайлом)
+	maskW, maskH   int     // габариты записанной маски
+	maskPx         int     // число пикселей маски
+	touch          int     // сколько сторон окна маска задевает (0..4)
 	decision       string
+}
+
+// boxTouchesTileBorder сообщает, прижата ли сторона СЫРОГО бокса (до
+// обрезки тайлом) к границе тайла или выходит за неё.
+func boxTouchesTileBorder(cand yoloCandidate, tile, tolPx int) bool {
+	cx := (cand.x1 + cand.x2) / 2
+	cy := (cand.y1 + cand.y2) / 2
+	tol := float32(tolPx)
+	edge := float32(tile) - tol
+	return cx-cand.rawW/2 <= tol || cy-cand.rawH/2 <= tol ||
+		cx+cand.rawW/2 >= edge || cy+cand.rawH/2 >= edge
+}
+
+// candidateCenterInMargin — центр детекции лежит в краевой полосе тайла
+// шириной bound, и с этой стороны есть соседний тайл. По построению сетки
+// (step = tile - 2*bound) такой объект попадает в ЯДРО соседнего тайла.
+func candidateCenterInMargin(cand yoloCandidate, img *OrthoImage, patch patchInfo, tile, bound int) bool {
+	cx := (cand.x1 + cand.x2) / 2
+	cy := (cand.y1 + cand.y2) / 2
+	return (patch.x > 0 && cx < float32(bound)) ||
+		(patch.x+tile < img.W && cx > float32(tile-bound)) ||
+		(patch.y > 0 && cy < float32(bound)) ||
+		(patch.y+tile < img.H && cy > float32(tile-bound))
 }
 
 // deferredCand — отложенный подозрительный кандидат частотного фильтра
@@ -296,6 +323,80 @@ func maskWriteTrim(bound int) int {
 	return t
 }
 
+// maskWindow возвращает окно ЧТЕНИЯ маски кандидата в координатах тайла.
+//
+// ПРИЧИНА ПОЯВЛЕНИЯ (пропуски и «прямоугольные» границы у площадных классов):
+// штатный YOLO-seg обрезает маску инстанса прямоугольником его bbox. Для
+// компактных объектов (здания) это верно — объект целиком внутри бокса.
+// Для «ковровых» классов (борщевик, зарастание) это фатально по двум причинам:
+//
+//  1. голова DFL YOLO11 имеет reg_max=16, то есть расстояние от якоря до
+//     стороны бокса не превышает 15 ячеек. Максимальная сторона бокса равна
+//     30*stride_max = 30*32 = 960 px. Массив борщевика, занимающий тайл
+//     1536x1536, В ПРИНЦИПЕ не может быть охвачен боксом: бокс «упирается» в
+//     960 px, маска обрезается по нему, и в результат уходит прямоугольник с
+//     идеально ровными сторонами, а всё, что дальше, теряется;
+//  2. даже когда объект помещается в бокс, регрессия бокса на диффузном
+//     объекте без чётких границ занижена, и маска срезается по прямой линии.
+//
+// Режим "semantic" читает маску по всему тайлу (bbox — лишь признак наличия
+// объекта); "instance" сохраняет прежнее поведение, но допускает расширение
+// окна на MaskBBoxMargin долей стороны бокса.
+func maskWindow(cand yoloCandidate, tile int, spec ModelSpec) (int, int, int, int) {
+	if spec.SemanticMask() {
+		return 0, 0, tile, tile
+	}
+	x0f, y0f := float64(cand.x1), float64(cand.y1)
+	x1f, y1f := float64(cand.x2), float64(cand.y2)
+	if spec.MaskBBoxMargin > 0 {
+		mw := (x1f - x0f) * float64(spec.MaskBBoxMargin)
+		mh := (y1f - y0f) * float64(spec.MaskBBoxMargin)
+		x0f -= mw
+		x1f += mw
+		y0f -= mh
+		y1f += mh
+	}
+	return int(math.Floor(x0f)), int(math.Floor(y0f)), int(math.Ceil(x1f)), int(math.Ceil(y1f))
+}
+
+// protoMaskWindow считает вероятности маски кандидата ОДИН РАЗ на ячейку
+// prototype-сетки (обычно 1/4 разрешения тайла) для окна [x0,x1)x[y0,y1).
+// Прежний код выполнял свёртку по maskDim для КАЖДОГО пикселя полного
+// разрешения, то есть 16 раз подряд считал один и тот же результат; это же
+// делало режим semantic (окно = весь тайл) неприемлемо дорогим.
+// Возвращает буфер вероятностей и геометрию окна в proto-координатах.
+func protoMaskWindow(cand yoloCandidate, proto []float32, protoH, protoW, maskDim int, sx, sy float32, x0, y0, x1, y1 int) (probs []float32, px0, py0, pw int) {
+	clampProto := func(v, hi int) int {
+		if v < 0 {
+			return 0
+		}
+		if v >= hi {
+			return hi - 1
+		}
+		return v
+	}
+	px0 = clampProto(int(float32(x0)*sx), protoW)
+	px1 := clampProto(int(float32(x1-1)*sx), protoW)
+	py0 = clampProto(int(float32(y0)*sy), protoH)
+	py1 := clampProto(int(float32(y1-1)*sy), protoH)
+	pw = px1 - px0 + 1
+	ph := py1 - py0 + 1
+	probs = make([]float32, pw*ph)
+	plane := protoH * protoW
+	for py := py0; py <= py1; py++ {
+		row := (py - py0) * pw
+		for px := px0; px <= px1; px++ {
+			base := py*protoW + px
+			v := float32(0)
+			for m := 0; m < maskDim; m++ {
+				v += cand.coeff[m] * proto[m*plane+base]
+			}
+			probs[row+px-px0] = sigmoid(v)
+		}
+	}
+	return probs, px0, py0, pw
+}
+
 func assignClassPixel(classMap []uint16, scoreMap []float32, idx, classID int, score float32) bool {
 	if idx < 0 || idx >= len(classMap) || idx >= len(scoreMap) || classID < 0 || score <= scoreMap[idx] {
 		return false
@@ -304,6 +405,28 @@ func assignClassPixel(classMap []uint16, scoreMap []float32, idx, classID int, s
 	scoreMap[idx] = score
 	classMap[idx] = uint16(classID + 1)
 	return wasBackground
+}
+
+// maskEdgeTouches считает, скольких сторон окна чтения касается маска.
+// touch = 4 означает, что маска упирается в окно со всех сторон: её реальные
+// границы срезаны прямоугольником окна, и в результате появятся ровные
+// стороны. Значение выводится в CSV (dump_candidates) как колонка touch.
+func maskEdgeTouches(minX, minY, maxX, maxY, x0, y0, x1, y1, bound int) int {
+	edgeMargin := max(2, bound/8)
+	n := 0
+	if minX <= x0+edgeMargin {
+		n++
+	}
+	if minY <= y0+edgeMargin {
+		n++
+	}
+	if maxX >= x1-1-edgeMargin {
+		n++
+	}
+	if maxY >= y1-1-edgeMargin {
+		n++
+	}
+	return n
 }
 
 func rasterizeYOLOClassMap(classMap []uint16, scoreMap []float32, img *OrthoImage, patch patchInfo, tile, bound int, cand yoloCandidate, proto []float32, protoH, protoW, maskDim int, maskThreshold float32, spec ModelSpec) (int, candidateRecord) {
@@ -337,13 +460,39 @@ func rasterizeYOLOClassMap(classMap []uint16, scoreMap []float32, img *OrthoImag
 	// дополняет результат. Параметр bound теперь управляет только величиной
 	// перекрытия тайлов (step = tile - 2*bound), а не зоной записи.
 	written := 0
+
+	// Безусловный предел размера детекции (reject_box_tile_ratio).
+	if spec.RejectBoxTileRatio > 0 {
+		limit := float32(tile) * spec.RejectBoxTileRatio
+		if cand.rawW >= limit || cand.rawH >= limit {
+			rec.decision = "reject_box_size"
+			return 0, rec
+		}
+	}
+
+	// Фильтр краевых гигантских детекций (reject_edge_oversize).
+	// Проверяется ДО вычисления маски: такие кандидаты дороги и бесполезны.
+	// Сплошной массив растительности, уходящий за границу тайла, заставляет
+	// модель выдать огромный бокс, прижатый к краю тайла. Его маска рыхлая
+	// (заполнение 0.35-0.5), поэтому reject_edge_boxfill его не ловит, а
+	// объединение таких боксов по всему листу заливает карту сплошняком с
+	// прямоугольными границами по линиям сетки тайлов. Центр такого объекта
+	// лежит в краевой полосе, то есть в ядре соседнего тайла — там он будет
+	// записан с неусечённой маской.
+	if spec.RejectEdgeOversize > 0 {
+		limit := float32(tile) * spec.RejectEdgeOversize
+		if (cand.rawW >= limit || cand.rawH >= limit) &&
+			candidateCenterInMargin(cand, img, patch, tile, bound) &&
+			boxTouchesTileBorder(cand, tile, spec.RejectEdgePinPx) {
+			rec.decision = "reject_edge_oversize"
+			return 0, rec
+		}
+	}
+
 	trim := maskWriteTrim(bound)
 	sx := float32(protoW) / float32(tile)
 	sy := float32(protoH) / float32(tile)
-	x0 := int(math.Floor(float64(cand.x1)))
-	y0 := int(math.Floor(float64(cand.y1)))
-	x1 := int(math.Ceil(float64(cand.x2)))
-	y1 := int(math.Ceil(float64(cand.y2)))
+	x0, y0, x1, y1 := maskWindow(cand, tile, spec)
 	if patch.x > 0 && x0 < trim {
 		x0 = trim
 	}
@@ -373,6 +522,81 @@ func rasterizeYOLOClassMap(classMap []uint16, scoreMap []float32, img *OrthoImag
 		return 0, rec
 	}
 
+	rec.winW = x1 - x0
+	rec.winH = y1 - y0
+
+	// Вероятности маски считаются один раз на ячейку proto-сетки.
+	probs, px0, py0, pw := protoMaskWindow(cand, proto, protoH, protoW, maskDim, sx, sy, x0, y0, x1, y1)
+	probAt := func(xx, yy int) float32 {
+		px := int(float32(xx) * sx)
+		if px < px0 {
+			px = px0
+		}
+		py := int(float32(yy) * sy)
+		if py < py0 {
+			py = py0
+		}
+		i := (py-py0)*pw + (px - px0)
+		if i < 0 || i >= len(probs) {
+			return 0
+		}
+		return probs[i]
+	}
+
+	// Режим semantic: маска не обрезается боксом, окно — весь тайл, поэтому
+	// накапливать список пикселей в памяти нельзя (до 2.4 млн на кандидата)
+	// и boxfill-фильтры бессмысленны (заполнение считалось бы по тайлу).
+	if spec.SemanticMask() {
+		sMinX, sMinY := tile, tile
+		sMaxX, sMaxY := -1, -1
+		for yy := y0; yy < y1; yy++ {
+			gy := patch.y + yy
+			if gy < 0 || gy >= img.H {
+				continue
+			}
+			for xx := x0; xx < x1; xx++ {
+				gx := patch.x + xx
+				if gx < 0 || gx >= img.W {
+					continue
+				}
+				idx := gy*img.W + gx
+				if img.ValidMask[idx] == 0 {
+					continue
+				}
+				maskProb := probAt(xx, yy)
+				if maskProb < maskThreshold {
+					continue
+				}
+				rec.maskPx++
+				if xx < sMinX {
+					sMinX = xx
+				}
+				if yy < sMinY {
+					sMinY = yy
+				}
+				if xx > sMaxX {
+					sMaxX = xx
+				}
+				if yy > sMaxY {
+					sMaxY = yy
+				}
+				if assignClassPixel(classMap, scoreMap, idx, cand.classID, cand.score*maskProb) {
+					written++
+				}
+			}
+		}
+		if rec.maskPx == 0 {
+			rec.decision = "empty_mask"
+			return 0, rec
+		}
+		rec.maskW = sMaxX - sMinX + 1
+		rec.maskH = sMaxY - sMinY + 1
+		rec.fill = float32(rec.maskPx) / float32(rec.maskW*rec.maskH)
+		rec.touch = maskEdgeTouches(sMinX, sMinY, sMaxX, sMaxY, x0, y0, x1, y1, bound)
+		rec.decision = "written"
+		return written, rec
+	}
+
 	type scoredPixel struct {
 		x, y  int
 		score float32
@@ -385,13 +609,6 @@ func rasterizeYOLOClassMap(classMap []uint16, scoreMap []float32, img *OrthoImag
 		if gy < 0 || gy >= img.H {
 			continue
 		}
-		py := int(float32(yy) * sy)
-		if py < 0 {
-			py = 0
-		}
-		if py >= protoH {
-			py = protoH - 1
-		}
 		for xx := x0; xx < x1; xx++ {
 			gx := patch.x + xx
 			if gx < 0 || gx >= img.W {
@@ -401,19 +618,7 @@ func rasterizeYOLOClassMap(classMap []uint16, scoreMap []float32, img *OrthoImag
 			if img.ValidMask[idx] == 0 {
 				continue
 			}
-			px := int(float32(xx) * sx)
-			if px < 0 {
-				px = 0
-			}
-			if px >= protoW {
-				px = protoW - 1
-			}
-			v := float32(0)
-			base := py*protoW + px
-			for m := 0; m < maskDim; m++ {
-				v += cand.coeff[m] * proto[m*protoH*protoW+base]
-			}
-			maskProb := sigmoid(v)
+			maskProb := probAt(xx, yy)
 			if maskProb >= maskThreshold {
 				pixels = append(pixels, scoredPixel{x: gx, y: gy, score: cand.score * maskProb})
 				if xx < minX {
@@ -453,6 +658,10 @@ func rasterizeYOLOClassMap(classMap []uint16, scoreMap []float32, img *OrthoImag
 	boxTileRatio := boxArea / usableArea
 	rectangularity := maskArea / boxArea
 	rec.fill = rectangularity
+	rec.maskW = boxW
+	rec.maskH = boxH
+	rec.maskPx = len(pixels)
+	rec.touch = maskEdgeTouches(minX, minY, maxX, maxY, x0, y0, x1, y1, bound)
 
 	// Фильтр вырожденных «квадратных» детекций (см. ModelSpec: reject_edge_boxfill,
 	// reject_boxfill, reject_boxfill_score). Их сигнатура: маска заливает свой
@@ -495,20 +704,7 @@ func rasterizeYOLOClassMap(classMap []uint16, scoreMap []float32, img *OrthoImag
 		}
 	}
 
-	touchCount := 0
-	edgeMargin := max(2, bound/8)
-	if minX <= x0+edgeMargin {
-		touchCount++
-	}
-	if minY <= y0+edgeMargin {
-		touchCount++
-	}
-	if maxX >= x1-1-edgeMargin {
-		touchCount++
-	}
-	if maxY >= y1-1-edgeMargin {
-		touchCount++
-	}
+	touchCount := rec.touch
 
 	// Reject the characteristic false positive: a very large, almost rectangular
 	// mask that touches most edges of the processed tile. This is safer than a
@@ -534,6 +730,70 @@ func rasterizeYOLOClassMap(classMap []uint16, scoreMap []float32, img *OrthoImag
 	rec.decision = "written"
 	return written, rec
 }
+
+// accumulateProbMap записывает в диагностический растр максимальную по всем
+// кандидатам тайла вероятность маски, вычисленную ПО ВСЕМУ ТАЙЛУ: ни окно
+// чтения (bbox + mask_bbox_margin), ни mask_threshold здесь не применяются.
+//
+// Зачем: если в результате видны ровные стороны полигонов, по этому растру
+// сразу видно, какая из двух причин действует. Если на _prob.tif граница
+// плавная и продолжается за пределы жёлтого полигона — объект обрезан окном
+// чтения, лечится mask_mode/mask_bbox_margin. Если на _prob.tif вероятность
+// сама обрывается по прямой — так предсказывает модель, и конфигом это не
+// лечится.
+func accumulateProbMap(probMap []uint8, img *OrthoImage, patch patchInfo, tile int, cands []yoloCandidate, proto []float32, protoH, protoW, maskDim int) {
+	if len(cands) == 0 || protoH <= 0 || protoW <= 0 {
+		return
+	}
+	const maxCands = 64
+	if len(cands) > maxCands {
+		cands = cands[:maxCands]
+	}
+	sx := float32(protoW) / float32(tile)
+	sy := float32(protoH) / float32(tile)
+	plane := protoH * protoW
+	cell := make([]float32, plane)
+	for i := range cell {
+		cell[i] = 0
+	}
+	for _, cand := range cands {
+		for p := 0; p < plane; p++ {
+			v := float32(0)
+			for m := 0; m < maskDim; m++ {
+				v += cand.coeff[m] * proto[m*plane+p]
+			}
+			if pv := sigmoid(v); pv > cell[p] {
+				cell[p] = pv
+			}
+		}
+	}
+	for yy := 0; yy < tile; yy++ {
+		gy := patch.y + yy
+		if gy < 0 || gy >= img.H {
+			continue
+		}
+		py := int(float32(yy) * sy)
+		if py >= protoH {
+			py = protoH - 1
+		}
+		for xx := 0; xx < tile; xx++ {
+			gx := patch.x + xx
+			if gx < 0 || gx >= img.W {
+				continue
+			}
+			px := int(float32(xx) * sx)
+			if px >= protoW {
+				px = protoW - 1
+			}
+			v := uint8(cell[py*protoW+px] * 255)
+			idx := gy*img.W + gx
+			if v > probMap[idx] {
+				probMap[idx] = v
+			}
+		}
+	}
+}
+
 func runYOLOSegOnImage(img *OrthoImage, sessions []*ORTSession, spec ModelSpec) ([]uint8, int, MaskDebugStats, error) {
 	tile := spec.Tile
 	if tile <= 0 {
@@ -551,6 +811,14 @@ func runYOLOSegOnImage(img *OrthoImage, sessions []*ORTSession, spec ModelSpec) 
 	classMap := make([]uint16, img.W*img.H)
 	scoreMap := make([]float32, img.W*img.H)
 	debug := MaskDebugStats{}
+	// Диагностический растр сырой вероятности маски (dump_prob_map).
+	// Заполняется ПО ВСЕМУ тайлу, без mask_threshold и без окна чтения, —
+	// это позволяет увидеть, где настоящая граница объекта по мнению модели,
+	// и отличить обрезку окном от отсутствия отклика модели.
+	var probMap []uint8
+	if spec.DumpProbMap {
+		probMap = make([]uint8, img.W*img.H)
+	}
 	if len(sessions) == 0 {
 		return nil, 0, debug, fmt.Errorf("no ONNX Runtime sessions opened")
 	}
@@ -591,7 +859,16 @@ func runYOLOSegOnImage(img *OrthoImage, sessions []*ORTSession, spec ModelSpec) 
 				if len(cands) == 0 {
 					continue
 				}
+				// cands отсортированы по убыванию score в decodeYOLOSeg.
+				// Ограничение нужно прежде всего в режиме semantic, где каждый
+				// кандидат читает маску по всему тайлу.
+				if spec.MaxMasksPerTile > 0 && len(cands) > spec.MaxMasksPerTile {
+					cands = cands[:spec.MaxMasksPerTile]
+				}
 				mapMu.Lock()
+				if probMap != nil {
+					accumulateProbMap(probMap, img, j.p, tile, cands, proto, protoH, protoW, spec.YoloMaskDim)
+				}
 				for _, c := range cands {
 					n, rec := rasterizeYOLOClassMap(classMap, scoreMap, img, j.p, tile, bound, c, proto, protoH, protoW, spec.YoloMaskDim, spec.MaskThreshold, spec)
 					res.debug.DetectedPixels += n
@@ -675,5 +952,6 @@ sendLoop:
 	}
 	applyValidMask(mask, img.ValidMask)
 	debug.FinalPixels = countMaskPixels(mask)
+	debug.ProbMap = probMap
 	return mask, runs, debug, nil
 }

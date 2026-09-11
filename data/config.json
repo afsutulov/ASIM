@@ -25,7 +25,9 @@
     },
     "ortophoto": {
       "name": "Ортофото снимкам (снимки с БПЛА)",
-      "list": ["ortophoto"]
+      "list": [
+        "ortophoto"
+      ]
     }
   },
   "compute": {
@@ -39,7 +41,12 @@
     "hogweed": {
       "description": "Зарастание Борщевиком Сосновского",
       "onnx_file": "hogweed.onnx",
-      "channels": ["B04", "B03", "B02", "B08"],
+      "channels": [
+        "B04",
+        "B03",
+        "B02",
+        "B08"
+      ],
       "tile": 256,
       "bound": 32,
       "threshold": 0.6,
@@ -52,12 +59,18 @@
     "fire": {
       "description": "Гари",
       "onnx_file": "fire.onnx",
-      "channels": ["B12", "B8A", "B03"],
+      "channels": [
+        "B12",
+        "B8A",
+        "B03"
+      ],
       "tile": 448,
       "bound": 32,
       "threshold": 0.5,
       "preprocess": "sentinel",
-      "poligons-off": ["naspunkti"],
+      "poligons-off": [
+        "naspunkti"
+      ],
       "min_area": 1000,
       "inputs": 1,
       "preserve_native_resolution": true
@@ -65,7 +78,11 @@
     "quarry": {
       "description": "Карьеры",
       "onnx_file": "quarry.onnx",
-      "channels": ["B04", "B03", "B02"],
+      "channels": [
+        "B04",
+        "B03",
+        "B02"
+      ],
       "tile": 448,
       "bound": 32,
       "threshold": 0.5,
@@ -77,7 +94,11 @@
     "landfill": {
       "description": "ТКО (свалки)",
       "onnx_file": "landfill.onnx",
-      "channels": ["B04", "B03", "B02"],
+      "channels": [
+        "B04",
+        "B03",
+        "B02"
+      ],
       "tile": 448,
       "bound": 32,
       "threshold": 0.1,
@@ -89,7 +110,12 @@
     "arable": {
       "description": "Границы пашни",
       "onnx_file": "arable.onnx",
-      "channels": ["B04", "B03", "B02", "B08"],
+      "channels": [
+        "B04",
+        "B03",
+        "B02",
+        "B08"
+      ],
       "tile": 448,
       "bound": 32,
       "threshold": 0.5,
@@ -102,12 +128,20 @@
       "description": "Ветровалы",
       "onnx_file": "windfall.onnx",
       "season": "summer",
-      "channels": ["B04", "B03", "B02", "B11"],
+      "channels": [
+        "B04",
+        "B03",
+        "B02",
+        "B11"
+      ],
       "tile": 448,
       "bound": 32,
       "threshold": 0.5,
       "preprocess": "sentinel",
-      "detection_classes": [1, 2],
+      "detection_classes": [
+        1,
+        2
+      ],
       "min_area": 1000,
       "inputs": 2,
       "best_scene_per_tile": true,
@@ -123,7 +157,12 @@
       "description": "Вырубки (лето)",
       "onnx_file": "def_sum.onnx",
       "season": "summer",
-      "channels": ["B04", "B03", "B02", "B11"],
+      "channels": [
+        "B04",
+        "B03",
+        "B02",
+        "B11"
+      ],
       "tile": 448,
       "bound": 32,
       "threshold": 0.5,
@@ -136,7 +175,12 @@
       "description": "Вырубки (зима)",
       "onnx_file": "def_win.onnx",
       "season": "winter",
-      "channels": ["B04", "B03", "B02", "B11"],
+      "channels": [
+        "B04",
+        "B03",
+        "B02",
+        "B11"
+      ],
       "tile": 448,
       "bound": 32,
       "threshold": 0.5,
@@ -149,7 +193,12 @@
       "description": "Вырубки (весна)",
       "onnx_file": "def_spr.onnx",
       "season": "spring",
-      "channels": ["B04", "B03", "B02", "B11"],
+      "channels": [
+        "B04",
+        "B03",
+        "B02",
+        "B11"
+      ],
       "tile": 448,
       "bound": 32,
       "threshold": 0.5,
@@ -162,7 +211,12 @@
       "description": "Вырубки (осень)",
       "onnx_file": "def_aut.onnx",
       "season": "autumn",
-      "channels": ["B04", "B03", "B02", "B11"],
+      "channels": [
+        "B04",
+        "B03",
+        "B02",
+        "B11"
+      ],
       "tile": 448,
       "bound": 32,
       "threshold": 0.5,
@@ -174,7 +228,10 @@
     "forest_disease": {
       "description": "Границы усыхания лесной растительности",
       "season": "summer",
-      "channels": ["B05", "B06"],
+      "channels": [
+        "B05",
+        "B06"
+      ],
       "preprocess": "pathology",
       "inputs": 1,
       "min_area": 10000,
@@ -183,7 +240,10 @@
     "forest_disease_diff": {
       "description": "Границы усыхания лесной растительности (год к году)",
       "season": "summer",
-      "channels": ["B05", "B06"],
+      "channels": [
+        "B05",
+        "B06"
+      ],
       "preprocess": "pathology_diff",
       "inputs": 2,
       "min_area": 10000,
@@ -192,8 +252,14 @@
     "overgrowth": {
       "description": "Границы зарастания сельхоз полей",
       "onnx_file": "overgrowth.onnx",
-      "channels": ["B04", "B03", "B02"],
-      "poligons-on": ["pashni"],
+      "channels": [
+        "B04",
+        "B03",
+        "B02"
+      ],
+      "poligons-on": [
+        "pashni"
+      ],
       "tile": 224,
       "bound": 0,
       "threshold": 0.45,
@@ -206,7 +272,13 @@
     "water": {
       "description": "Водоемы (тестово)",
       "onnx_file": "water.onnx",
-      "channels": ["B02", "B03", "B04", "B08", "B11"],
+      "channels": [
+        "B02",
+        "B03",
+        "B04",
+        "B08",
+        "B11"
+      ],
       "tile": 512,
       "bound": 0,
       "threshold": 0.5,
@@ -216,19 +288,28 @@
       "min_area": 10000,
       "num_classes": 3,
       "overlap": 32,
-      "detection_classes": [1, 2],
+      "detection_classes": [
+        1,
+        2
+      ],
       "preserve_native_resolution": true
     },
     "reforestation": {
       "description": "Границы лесовосстановления",
       "onnx_file": "reforestation.onnx",
-      "channels": ["B04", "B03", "B02"],
+      "channels": [
+        "B04",
+        "B03",
+        "B02"
+      ],
       "tile": 448,
       "bound": 0,
       "preprocess": "sentinel",
       "inputs": 1,
       "num_classes": 3,
-      "detection_classes": [0],
+      "detection_classes": [
+        0
+      ],
       "min_area": 100,
       "simplify": 0,
       "best_scene_per_tile": true,
@@ -243,13 +324,28 @@
     "croptypes_yar": {
       "description": "Границы полей с типом культур: Яровые",
       "onnx_file": "croptypes.onnx",
-      "channels": ["NDVI1", "NDVI2", "NDVI3", "NDVI4", "NDVI5", "NDVI6", "NDVI7", "NDVI8", "NDVI9", "NDVI10", "NDVI11", "NDVI12"],
+      "channels": [
+        "NDVI1",
+        "NDVI2",
+        "NDVI3",
+        "NDVI4",
+        "NDVI5",
+        "NDVI6",
+        "NDVI7",
+        "NDVI8",
+        "NDVI9",
+        "NDVI10",
+        "NDVI11",
+        "NDVI12"
+      ],
       "tile": 512,
       "bound": 0,
       "preprocess": "identity",
       "inputs": 1,
       "num_classes": 4,
-      "detection_classes": [1],
+      "detection_classes": [
+        1
+      ],
       "min_area": 100,
       "simplify": 0,
       "best_scene_per_tile": true,
@@ -264,13 +360,28 @@
     "croptypes_ozi": {
       "description": "Границы полей с типом культур: Озимые",
       "onnx_file": "croptypes.onnx",
-      "channels": ["NDVI1", "NDVI2", "NDVI3", "NDVI4", "NDVI5", "NDVI6", "NDVI7", "NDVI8", "NDVI9", "NDVI10", "NDVI11", "NDVI12"],
+      "channels": [
+        "NDVI1",
+        "NDVI2",
+        "NDVI3",
+        "NDVI4",
+        "NDVI5",
+        "NDVI6",
+        "NDVI7",
+        "NDVI8",
+        "NDVI9",
+        "NDVI10",
+        "NDVI11",
+        "NDVI12"
+      ],
       "tile": 512,
       "bound": 0,
       "preprocess": "identity",
       "inputs": 1,
       "num_classes": 4,
-      "detection_classes": [2],
+      "detection_classes": [
+        2
+      ],
       "min_area": 100,
       "simplify": 0,
       "best_scene_per_tile": true,
@@ -285,13 +396,28 @@
     "croptypes_kor": {
       "description": "Границы полей с типом культур: Кормовые",
       "onnx_file": "croptypes.onnx",
-      "channels": ["NDVI1", "NDVI2", "NDVI3", "NDVI4", "NDVI5", "NDVI6", "NDVI7", "NDVI8", "NDVI9", "NDVI10", "NDVI11", "NDVI12"],
+      "channels": [
+        "NDVI1",
+        "NDVI2",
+        "NDVI3",
+        "NDVI4",
+        "NDVI5",
+        "NDVI6",
+        "NDVI7",
+        "NDVI8",
+        "NDVI9",
+        "NDVI10",
+        "NDVI11",
+        "NDVI12"
+      ],
       "tile": 512,
       "bound": 0,
       "preprocess": "identity",
       "inputs": 1,
       "num_classes": 4,
-      "detection_classes": [3],
+      "detection_classes": [
+        3
+      ],
       "min_area": 100,
       "simplify": 0,
       "best_scene_per_tile": true,
@@ -308,7 +434,9 @@
       "onnx_file": "buildings.onnx",
       "preprocess": "ortophoto",
       "num_classes": 5,
-      "classes": [0],
+      "classes": [
+        0
+      ],
       "tile": 1536,
       "bound": 128,
       "normalization": "fixed",
@@ -327,7 +455,10 @@
       "yolo_mask_dim": 32,
       "yolo_proto_stride": 4,
       "input_name": "images",
-      "output_names": ["output0", "output1"],
+      "output_names": [
+        "output0",
+        "output1"
+      ],
       "min_area": 10,
       "min_area_m2": 10,
       "morph_open": 0,
@@ -361,7 +492,9 @@
       "onnx_file": "buildings.onnx",
       "preprocess": "ortophoto",
       "num_classes": 5,
-      "classes": [1],
+      "classes": [
+        1
+      ],
       "tile": 1536,
       "bound": 128,
       "normalization": "fixed",
@@ -380,7 +513,10 @@
       "yolo_mask_dim": 32,
       "yolo_proto_stride": 4,
       "input_name": "images",
-      "output_names": ["output0", "output1"],
+      "output_names": [
+        "output0",
+        "output1"
+      ],
       "min_area": 10,
       "min_area_m2": 10,
       "morph_open": 0,
@@ -414,7 +550,9 @@
       "onnx_file": "buildings.onnx",
       "preprocess": "ortophoto",
       "num_classes": 5,
-      "classes": [2],
+      "classes": [
+        2
+      ],
       "tile": 1536,
       "bound": 128,
       "normalization": "fixed",
@@ -433,7 +571,10 @@
       "yolo_mask_dim": 32,
       "yolo_proto_stride": 4,
       "input_name": "images",
-      "output_names": ["output0", "output1"],
+      "output_names": [
+        "output0",
+        "output1"
+      ],
       "min_area": 5,
       "min_area_m2": 5,
       "morph_open": 0,
@@ -467,7 +608,9 @@
       "onnx_file": "buildings.onnx",
       "preprocess": "ortophoto",
       "num_classes": 5,
-      "classes": [3],
+      "classes": [
+        3
+      ],
       "tile": 1536,
       "bound": 128,
       "normalization": "fixed",
@@ -486,7 +629,10 @@
       "yolo_mask_dim": 32,
       "yolo_proto_stride": 4,
       "input_name": "images",
-      "output_names": ["output0", "output1"],
+      "output_names": [
+        "output0",
+        "output1"
+      ],
       "min_area": 5,
       "min_area_m2": 5,
       "morph_open": 0,
@@ -520,7 +666,9 @@
       "onnx_file": "buildings.onnx",
       "preprocess": "ortophoto",
       "num_classes": 5,
-      "classes": [4],
+      "classes": [
+        4
+      ],
       "tile": 1536,
       "bound": 128,
       "normalization": "fixed",
@@ -539,7 +687,10 @@
       "yolo_mask_dim": 32,
       "yolo_proto_stride": 4,
       "input_name": "images",
-      "output_names": ["output0", "output1"],
+      "output_names": [
+        "output0",
+        "output1"
+      ],
       "min_area": 5,
       "min_area_m2": 5,
       "morph_open": 0,
@@ -573,7 +724,11 @@
       "onnx_file": "buildings.onnx",
       "preprocess": "ortophoto",
       "num_classes": 5,
-      "classes": [2, 3, 4],
+      "classes": [
+        2,
+        3,
+        4
+      ],
       "tile": 1536,
       "bound": 128,
       "normalization": "fixed",
@@ -592,7 +747,10 @@
       "yolo_mask_dim": 32,
       "yolo_proto_stride": 4,
       "input_name": "images",
-      "output_names": ["output0", "output1"],
+      "output_names": [
+        "output0",
+        "output1"
+      ],
       "min_area": 5,
       "min_area_m2": 5,
       "morph_open": 0,
@@ -625,57 +783,29 @@
       "description": "Зарастание Борщевиком Сосновского (БПЛА)",
       "onnx_file": "hogweed_bpla.onnx",
       "preprocess": "ortophoto",
-
+      "model_kind": "semantic",
       "num_classes": 1,
       "classes": [0],
-
-      "tile": 1536,
-      "bound": 256,
-
+      "tile": 512,
+      "bound": 64,
+      "semantic_edge_ignore": 16,
       "normalization": "fixed",
-
-      "threshold": 0.15,
-
-      "class_thresholds": {
-        "0": 0.15
-      },
-
-      "nms_threshold": 1.0,
-      "agnostic_nms": false,
-      "exclusive_classes": true,
-
-      "mask_threshold": 0.3,
-
-      "yolo_mask_dim": 32,
-      "yolo_proto_stride": 4,
-
+      "semantic_threshold": 0.6,
+      "exclusive_classes": false,
       "input_name": "images",
-      "output_names": ["output0", "output1"],
-
-      "min_area": 10,
-      "min_area_m2": 1,
-
+      "output_names": ["output"],
+      "min_area": 25,
+      "min_area_m2": 2,
       "morph_open": 0,
-      "morph_close": 0,
-
-      "fill_holes": false,
-      "max_hole_area": 0,
-
-      "simplify": 0,
-
-      "reject_tile_mask_ratio": 0,
-      "reject_tile_edge_touches": 0,
-      "reject_rectangularity": 0,
-      "reject_min_box_tile_ratio": 0,
-      "reject_edge_boxfill": 0,
-      "reject_boxfill": 0,
-      "reject_boxfill_score": 0,
-      "reject_dfl_size_tol": 0,
-      "reject_repeat_count": 0,
-
+      "morph_close": 4,
+      "fill_holes": true,
+      "max_hole_area": 4000,
+      "dissolve_result": true,
+      "dissolve_seam_close_m": 0.2,
+      "dump_coverage": true,
+      "simplify": 0.15,
       "skip_empty_tiles": true,
       "min_content_pixels": 1,
-
       "class_merge_rules": []
     }
   }

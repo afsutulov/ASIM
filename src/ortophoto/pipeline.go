@@ -49,11 +49,22 @@ type MaskDebugStats struct {
 	// Candidates — диагностические записи по кандидатам (только при
 	// spec.DumpCandidates).
 	Candidates []candidateRecord
+	// ProbMap — растр сырой вероятности маски 0..255 по всему листу
+	// (только при spec.DumpProbMap): максимум по кандидатам, без окна
+	// чтения и без mask_threshold.
+	ProbMap []uint8
 }
 
 // writeCandidateCSV пишет диагностику кандидатов одного листа: координаты
 // центра бокса в пикселях листа и в СК листа (через geotransform), сырые
-// размеры бокса, score, класс, заполнение бокса маской и решение фильтров.
+// размеры бокса, score, класс, заполнение маской собственного bbox, размер
+// окна чтения маски (win_w/win_h), габариты и площадь самой маски
+// (mask_w/mask_h/mask_px), число сторон окна, в которые маска упирается
+// (touch), и решение фильтров.
+//
+// touch — ключевая колонка для диагностики ровных границ: touch = 3..4
+// означает, что маска срезана прямоугольником окна со всех сторон, то есть
+// в результат уйдёт прямая линия, а не настоящая граница объекта.
 func writeCandidateCSV(path string, recs []candidateRecord, geo [6]float64) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -62,12 +73,13 @@ func writeCandidateCSV(path string, recs []candidateRecord, geo [6]float64) erro
 	defer f.Close()
 	w := bufio.NewWriter(f)
 	defer w.Flush()
-	fmt.Fprintln(w, "patch_x,patch_y,cx_px,cy_px,geo_x,geo_y,raw_w,raw_h,score,class,fill,decision")
+	fmt.Fprintln(w, "patch_x,patch_y,cx_px,cy_px,geo_x,geo_y,raw_w,raw_h,score,class,fill,win_w,win_h,mask_w,mask_h,mask_px,touch,decision")
 	for _, r := range recs {
 		gx := geo[0] + r.cxPx*geo[1] + r.cyPx*geo[2]
 		gy := geo[3] + r.cxPx*geo[4] + r.cyPx*geo[5]
-		fmt.Fprintf(w, "%d,%d,%.1f,%.1f,%.3f,%.3f,%.1f,%.1f,%.4f,%d,%.4f,%s\n",
-			r.patchX, r.patchY, r.cxPx, r.cyPx, gx, gy, r.rawW, r.rawH, r.score, r.classID, r.fill, r.decision)
+		fmt.Fprintf(w, "%d,%d,%.1f,%.1f,%.3f,%.3f,%.1f,%.1f,%.4f,%d,%.4f,%d,%d,%d,%d,%d,%d,%s\n",
+			r.patchX, r.patchY, r.cxPx, r.cyPx, gx, gy, r.rawW, r.rawH, r.score, r.classID, r.fill,
+			r.winW, r.winH, r.maskW, r.maskH, r.maskPx, r.touch, r.decision)
 	}
 	return nil
 }
@@ -211,6 +223,9 @@ func extractPatch(img *OrthoImage, x, y, tile int) ([]float32, []uint8) {
 }
 
 func runModelOnImage(img *OrthoImage, sessions []*ORTSession, spec ModelSpec) ([]uint8, int, MaskDebugStats, error) {
+	if spec.IsSemanticModel() {
+		return runSemanticOnImage(img, sessions, spec)
+	}
 	return runYOLOSegOnImage(img, sessions, spec)
 }
 
@@ -264,6 +279,68 @@ func zipDirExcluding(srcDir, zipPath, excludePath string) error {
 	})
 }
 
+// zipFiles архивирует только явно перечисленные файлы.
+// Используется для публичного результата ortophoto: диагностические TIFF/CSV,
+// coverage-слои и result.json могут оставаться в рабочем каталоге, но никогда
+// не попадают в пользовательский ZIP.
+func zipFiles(paths []string, zipPath string) error {
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	defer zf.Close()
+
+	zw := zip.NewWriter(zf)
+	defer zw.Close()
+
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		if _, ok := seen[abs]; ok {
+			continue
+		}
+		seen[abs] = struct{}{}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("archive result is not a regular file: %s", path)
+		}
+
+		hdr, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.Base(path)
+		hdr.Method = zip.Deflate
+		w, err := zw.CreateHeader(hdr)
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(w, f)
+		closeErr := f.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	return nil
+}
+
 func openORTSessions(app *AppConfig, spec ModelSpec, modelPath string) ([]*ORTSession, error) {
 	deviceIDs := append([]int(nil), app.Compute.GPUs...)
 	if len(deviceIDs) == 0 {
@@ -274,9 +351,13 @@ func openORTSessions(app *AppConfig, spec ModelSpec, modelPath string) ([]*ORTSe
 	}
 	outputNames := append([]string(nil), spec.OutputNames...)
 	if len(outputNames) == 0 {
-		outputNames = []string{"output0", "output1"}
+		if spec.IsSemanticModel() {
+			outputNames = []string{"output"}
+		} else {
+			outputNames = []string{"output0", "output1"}
+		}
 	}
-	log.Printf("ortophoto opening model sessions: model=%s path=%s input=%s outputs=%v device=%s gpus=%v", spec.Name, modelPath, spec.InputName, outputNames, app.Compute.Device, deviceIDs)
+	log.Printf("ortophoto opening model sessions: model=%s kind=%s path=%s input=%s outputs=%v device=%s gpus=%v", spec.Name, spec.ModelKind, modelPath, spec.InputName, outputNames, app.Compute.Device, deviceIDs)
 
 	sessions := make([]*ORTSession, 0, len(deviceIDs))
 	for _, gpuID := range deviceIDs {
@@ -375,6 +456,13 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 	wgsResultPolygons := 0
 	log.Printf("ortophoto metric CRS for filters: MSK-59 zone=%d search_center_lon=%.6f", targetZone, (searchEnv.MinX+searchEnv.MaxX)/2)
 
+	// Слой покрытия: контуры листов, реально дошедших до модели, и контуры
+	// пропущенных. Нужен, чтобы отличить «лист не обработан» от «модель здесь
+	// ничего не нашла» — по одному лишь результату это неразличимо, и то и
+	// другое выглядит как прямоугольная область без полигонов.
+	coverage := &coverageAccumulator{}
+	defer coverage.close()
+
 	processedDurSum := time.Duration(0)
 	for _, tif := range files {
 		imgStart := time.Now()
@@ -383,6 +471,8 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 
 		info, err := ReadOrthophotoInfo(tif)
 		if err != nil {
+			// Контур неизвестен — лист в слой покрытия не попадёт вообще.
+			// Такой случай виден только в журнале и в result.json.
 			log.Printf("ortophoto metadata read failed: file=%s error=%v", tif, err)
 			imgStat.Skipped = true
 			imgStat.SkipReason = err.Error()
@@ -396,6 +486,7 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 			imgStat.Skipped = true
 			imgStat.SkipReason = "unsupported/unknown CRS: " + err.Error()
 			stats.Images = append(stats.Images, imgStat)
+			coverage.add(info.Geo, info.W, info.H, info.Proj, false)
 			continue
 		}
 		log.Printf("ortophoto source CRS: file=%s group=%s detail=%s", filepath.Base(tif), sourceGroup, sourceCRSLabel)
@@ -410,6 +501,7 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 			imgStat.SkipReason = "outside search polygon"
 			imgStat.Duration = time.Since(imgStart)
 			stats.Images = append(stats.Images, imgStat)
+			coverage.add(info.Geo, info.W, info.H, info.Proj, false)
 			log.Printf("ortophoto image skipped by spatial prefilter: file=%s path=%s", filepath.Base(tif), tif)
 			continue
 		}
@@ -427,8 +519,11 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 			imgStat.Skipped = true
 			imgStat.SkipReason = err.Error()
 			stats.Images = append(stats.Images, imgStat)
+			coverage.add(info.Geo, info.W, info.H, info.Proj, false)
 			continue
 		}
+		// Лист дошёл до модели — его контур попадает в покрытие.
+		coverage.add(img.Geo, img.W, img.H, img.Proj, true)
 
 		mask, runs, dbg, err := runModelOnImage(img, sessions, cfg.Spec)
 		stats.ModelRuns += runs
@@ -436,6 +531,14 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 		imgStat.FinalPixels = dbg.FinalPixels
 		if err != nil {
 			return "", stats, err
+		}
+		if cfg.Spec.DumpProbMap && len(dbg.ProbMap) == img.W*img.H {
+			probTif := filepath.Join(workDir, safeName(filepath.Base(tif))+"_prob.tif")
+			if perr := WriteGeoTIFFMask(probTif, dbg.ProbMap, img.W, img.H, img.Geo, img.Proj); perr != nil {
+				log.Printf("ortophoto prob map dump failed: file=%s error=%v", tif, perr)
+			} else {
+				log.Printf("ortophoto prob map dump: %s", probTif)
+			}
 		}
 		if cfg.Spec.DumpCandidates {
 			csvPath := filepath.Join(workDir, safeName(filepath.Base(tif))+"_candidates.csv")
@@ -540,12 +643,53 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 	// преобразуется и не копируется во второй файл: принадлежность определяется
 	// исключительно CRS исходного GeoTIFF.
 	generatedOutputs := make([]string, 0, 2)
+	resultOutputPaths := make([]string, 0, 2)
+	log.Printf("ortophoto stage: sheets finished, postprocessing start: msk_polygons=%d wgs_polygons=%d", mskResultPolygons, wgsResultPolygons)
+
+	// Объединение полигонов накопителя. Выполняется ПОСЛЕ того, как в
+	// накопитель дописаны результаты всех листов, и ДО выгрузки в GeoJSON —
+	// только на этом этапе видны обе половины объекта, разрезанного границей
+	// листа.
+	//
+	// Шаг намеренно не прерывает задачу при ошибке: неразъединённый результат
+	// геометрически корректен, он лишь содержит лишние внутренние границы.
+	// Потерять весь прогон из-за постобработки хуже, чем отдать его как есть.
+	if cfg.Spec.DissolveResult {
+		// Этапы после цикла по листам логируются по отдельности: раньше между
+		// «image done» последнего листа и появлением GeoJSON не было ни одной
+		// записи, и зависание внутри постобработки было неотличимо от
+		// зависания при архивации.
+		log.Printf("ortophoto stage: dissolve start")
+		if seenMSKSource {
+			// МСК-59 — метрическая СК, радиус замыкания передаётся как есть.
+			if n, derr := DissolveAccumulatorShapefile(mskResultShp, cfg.Spec.DissolveSeamCloseM); derr != nil {
+				log.Printf("ortophoto dissolve skipped for MSK59 result, raw polygons are kept: error=%v", derr)
+			} else {
+				mskResultPolygons = n
+			}
+		}
+		if seenWGSSource {
+			// WGS84 — географическая СК, единицы слоя градусы. Переводим метры
+			// в градусы по широте (1 градус широты ~ 111320 м). Для замыкания
+			// зазора в считанные сантиметры разница между широтным и
+			// долготным масштабом несущественна.
+			seamDeg := cfg.Spec.DissolveSeamCloseM / 111320.0
+			if n, derr := DissolveAccumulatorShapefile(wgsResultShp, seamDeg); derr != nil {
+				log.Printf("ortophoto dissolve skipped for WGS84 result, raw polygons are kept: error=%v", derr)
+			} else {
+				wgsResultPolygons = n
+			}
+		}
+	}
+
+	log.Printf("ortophoto stage: geojson export start")
 	if seenMSKSource {
 		mskGeoJSON := filepath.Join(workDir, fmt.Sprintf("%s_MSK59-%d.geojson", baseName, targetZone))
 		if err := ExportShapefileToGeoJSON(mskResultShp, mskGeoJSON); err != nil {
 			return "", stats, err
 		}
 		generatedOutputs = append(generatedOutputs, filepath.Base(mskGeoJSON))
+		resultOutputPaths = append(resultOutputPaths, mskGeoJSON)
 	}
 	if seenWGSSource {
 		wgsGeoJSON := filepath.Join(workDir, baseName+"_WGS84_EPSG4326.geojson")
@@ -555,9 +699,24 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 			return "", stats, err
 		}
 		generatedOutputs = append(generatedOutputs, filepath.Base(wgsGeoJSON))
+		resultOutputPaths = append(resultOutputPaths, wgsGeoJSON)
 	}
 	if !seenMSKSource && !seenWGSSource {
 		return "", stats, fmt.Errorf("no orthophoto source CRS groups were processed")
+	}
+
+	// Слой покрытия кладётся рядом с результатом. Загрузив его в QGIS поверх
+	// полигонов, сразу видно, чем является прямая граница результата: краем
+	// обработанных данных или настоящей границей срабатывания модели.
+	if cfg.Spec.DumpCoverage {
+		log.Printf("ortophoto stage: coverage start")
+		for _, p := range coverage.write(
+			filepath.Join(workDir, baseName+"_coverage_processed.geojson"),
+			filepath.Join(workDir, baseName+"_coverage_skipped.geojson"),
+		) {
+			generatedOutputs = append(generatedOutputs, filepath.Base(p))
+		}
+		log.Printf("ortophoto coverage summary: %s", coverage.summary())
 	}
 
 	// Shapefile остаётся только внутренним транспортным форматом.
@@ -595,7 +754,11 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 	}
 
 	zipPath := filepath.Join(cfg.App.ResultsPath, safeName(cfg.OutputName)+".zip")
-	if err := zipDirExcluding(workDir, zipPath, manifestPath); err != nil {
+	log.Printf("ortophoto stage: archive start: path=%s", zipPath)
+	// Публичный архив содержит ТОЛЬКО итоговые GeoJSON с результатами.
+	// Диагностические coverage/probability/candidates/result.json остаются
+	// исключительно во временном workDir и удаляются вместе с ним.
+	if err := zipFiles(resultOutputPaths, zipPath); err != nil {
 		return "", stats, err
 	}
 	return zipPath, stats, nil

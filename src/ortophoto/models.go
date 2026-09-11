@@ -3,13 +3,20 @@ package main
 import "strings"
 
 // ModelSpec describes one orthophoto detection task.
-// Ortophoto module is YOLO11-seg only. Sentinel/UNet models are handled by the sentinel module.
+// Ortophoto supports YOLO11 instance segmentation and dense semantic ONNX models. Sentinel multispectral models are handled by the sentinel module.
 type ModelSpec struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	ONNXFile    string `json:"onnx_file"`
 	Preprocess  string `json:"preprocess"`
-	Tile        int    `json:"tile,omitempty"`
+	// ModelKind selects the inference/postprocessing path:
+	//   "yolo_seg" (default) — YOLO11 instance segmentation, used for buildings,
+	//       pavilions, pavement and other compact objects;
+	//   "semantic" — dense per-pixel segmentation model with one ONNX output
+	//       [1,C,H,W], intended for area-like phenomena such as hogweed fields.
+	// Existing configs without model_kind keep the old YOLO-seg behaviour.
+	ModelKind string `json:"model_kind,omitempty"`
+	Tile      int    `json:"tile,omitempty"`
 
 	// Bound задаётся в JSON через указатель, чтобы отличать «не задано»
 	// (nil -> значение по умолчанию 128) от явного "bound": 0 (без перекрытия).
@@ -61,10 +68,20 @@ type ModelSpec struct {
 	YoloProtoStride int      `json:"yolo_proto_stride,omitempty"`
 	NMSThreshold    float32  `json:"nms_threshold,omitempty"`
 	MaskThreshold   float32  `json:"mask_threshold,omitempty"`
-	MorphOpen       int      `json:"morph_open,omitempty"`
-	MorphClose      int      `json:"morph_close,omitempty"`
-	FillHoles       bool     `json:"fill_holes,omitempty"`
-	MaxHoleArea     int      `json:"max_hole_area,omitempty"`
+	// SemanticThreshold is the probability threshold for model_kind="semantic".
+	// Pointer form distinguishes an explicit 0 from an omitted value.
+	// Default is 0.5. YOLO-seg models ignore this field.
+	SemanticThresholdJSON *float32 `json:"semantic_threshold,omitempty"`
+	SemanticThreshold     float32  `json:"-"`
+	// SemanticEdgeIgnore is a small unsafe border (pixels) discarded from
+	// interior semantic tiles. The remaining large overlap is merged by max
+	// probability. This avoids hard seams from core-only stitching.
+	// 0 means automatic: min(16, bound/4).
+	SemanticEdgeIgnore int  `json:"semantic_edge_ignore,omitempty"`
+	MorphOpen          int  `json:"morph_open,omitempty"`
+	MorphClose         int  `json:"morph_close,omitempty"`
+	FillHoles          bool `json:"fill_holes,omitempty"`
+	MaxHoleArea        int  `json:"max_hole_area,omitempty"`
 
 	// Filters against YOLO-seg tile artefacts: sometimes a whole 1536x1536 patch
 	// is returned as one very rectangular object. Defaults are conservative and
@@ -133,6 +150,44 @@ type ModelSpec struct {
 	// фильтров) — для диагностики ложных срабатываний.
 	DumpCandidates bool `json:"dump_candidates,omitempty"`
 
+	// DissolveResult: объединять полигоны накопителя перед выгрузкой в
+	// GeoJSON.
+	//
+	// Ортофотоплан обрабатывается ПОЛИСТНО, и до появления этого шага заросль,
+	// пересекающая границу двух .tif, попадала в результат двумя отдельными
+	// объектами, состыкованными по прямой линии границы листа. В QGIS у
+	// каждого полигона рисуется обводка, поэтому такой стык выглядит как
+	// тёмная прямая линия поперёк массива и читается как «здесь не найдено»,
+	// хотя маска сплошная.
+	DissolveResult bool `json:"dissolve_result,omitempty"`
+
+	// DissolveSeamCloseM — радиус морфологического замыкания в МЕТРАХ,
+	// применяемый при объединении. Нужен, когда у листов ортофото есть кайма
+	// nodata: ReadOrthophoto помечает её в ValidMask, маска там обнуляется, и
+	// между полигонами соседних листов остаётся волосяной зазор, который
+	// простое объединение соприкасающихся геометрий не закрывает. Величина
+	// должна быть чуть больше ширины каймы: 0.1-0.3 м при GSD 5-10 см.
+	// 0 = только объединение, без замыкания.
+	DissolveSeamCloseM float64 `json:"dissolve_seam_close_m,omitempty"`
+
+	// DumpCoverage: выгружать рядом с результатом контуры листов, реально
+	// дошедших до модели (<base>_coverage_processed.geojson), и контуры
+	// пропущенных (<base>_coverage_skipped.geojson).
+	//
+	// Единственный способ отличить «лист не обработан» от «модель здесь ничего
+	// не нашла»: и то и другое выглядит на карте как прямоугольная область без
+	// полигонов с идеально прямыми сторонами.
+	DumpCoverage bool `json:"dump_coverage,omitempty"`
+
+	// DumpProbMap: писать рядом с маской растр <лист>_prob.tif со СЫРОЙ
+	// вероятностью маски (0..255) по всему листу — максимум по кандидатам
+	// тайла, вычисленный по всей площади тайла, БЕЗ окна чтения и БЕЗ
+	// mask_threshold. Единственный способ отличить «маску обрезало окно»
+	// от «модель так предсказывает»: на _prob.tif первое видно как плавное
+	// продолжение вероятности за границей жёлтого полигона, второе — как
+	// обрыв самой вероятности по прямой линии.
+	DumpProbMap bool `json:"dump_prob_map,omitempty"`
+
 	// SkipEmptyTiles enables the optional optimisation that avoids ONNX inference
 	// on almost completely nodata/white patches. Disabled by default because
 	// small valid fragments at a raster edge may contain real buildings.
@@ -142,7 +197,79 @@ type ModelSpec struct {
 	// ClassMergeRules are applied to the common exclusive class map before
 	// extracting the classes requested by this logical model.
 	ClassMergeRules []ClassMergeRule `json:"class_merge_rules,omitempty"`
+
+	// RejectBoxTileRatio — безусловный предел размера детекции: доля стороны
+	// тайла, начиная с которой кандидат отбрасывается независимо от его
+	// положения, score и заполнения маской. 0 = выключено.
+	//
+	// Зачем: у YOLO-seg маска инстанса определена только внутри bbox
+	// (Ultralytics считает segment-loss с crop_mask), и качество маски падает
+	// с ростом бокса. На «ковровых» классах крупные детекции вырождаются:
+	// маска перестаёт нести форму объекта и заливает окно целиком, давая
+	// прямоугольники в результате. Отсечение крупных боксов оставляет только
+	// тот масштаб, на котором сегментационная ветка реально работает.
+	RejectBoxTileRatio float32 `json:"reject_box_tile_ratio,omitempty"`
+
+	// RejectEdgeOversize отбрасывает «краевые» гигантские детекции: доля
+	// стороны тайла (0.25 = 25%), начиная с которой бокс считается крупным.
+	// Правило срабатывает ТОЛЬКО когда одновременно выполняется всё:
+	//   - сторона бокса >= RejectEdgeOversize * tile;
+	//   - центр детекции лежит в краевой полосе тайла (шириной bound), то
+	//     есть по гарантии покрытия сетки объект принадлежит ЯДРУ соседнего
+	//     тайла и будет записан оттуда;
+	//   - сторона бокса прижата к границе тайла или выходит за неё
+	//     (допуск RejectEdgePinPx).
+	//
+	// Сигнатура артефакта: сплошной массив растительности продолжается за
+	// границу тайла, модель видит обрезанный объект и выдаёт огромный бокс,
+	// «прилипший» к краю тайла, с рыхлой маской на пол-окна. Такие детекции
+	// не ловятся фильтром reject_edge_boxfill, потому что тот требует
+	// заливки бокса маской на ~100%, а здесь заливка около 0.4-0.5.
+	// 0 = фильтр выключен (значение по умолчанию; поведение моделей зданий
+	// и сооружений не меняется).
+	RejectEdgeOversize float32 `json:"reject_edge_oversize,omitempty"`
+
+	// RejectEdgePinPx — допуск в пикселях, при котором сторона бокса
+	// считается прижатой к границе тайла. По умолчанию 24 при включённом
+	// RejectEdgeOversize.
+	RejectEdgePinPx int `json:"reject_edge_pin_px,omitempty"`
+
+	// MaskMode — способ переноса маски инстанса YOLO-seg в растр.	//
+	//	"instance" (по умолчанию) — маска ОБРЕЗАЕТСЯ прямоугольником bbox
+	//	    (штатное поведение Ultralytics). Корректно для компактных
+	//	    объектов, целиком помещающихся в bbox: здания, сооружения.
+	//
+	//	"semantic" — bbox используется только как признак наличия объекта,
+	//	    а маска читается по ВСЕМУ тайлу. Режим предназначен для
+	//	    «ковровых» (площадных) классов — борщевик, зарастание, гари, —
+	//	    у которых объект физически не помещается в bbox: голова DFL
+	//	    YOLO11 (reg_max=16) не может предсказать сторону бокса длиннее
+	//	    30*stride = 960 px, поэтому массив борщевика в тайле 1536 px
+	//	    обрезается боксом и в результат попадает ПРЯМОУГОЛЬНИК с ровными
+	//	    сторонами, а всё, что вне бокса, теряется.
+	MaskMode string `json:"mask_mode,omitempty"`
+
+	// MaskBBoxMargin — расширение окна чтения маски в долях ширины/высоты
+	// bbox с каждой стороны (0.25 = +25%). Работает в режиме "instance" и
+	// убирает срез маски ровно по линии бокса. По умолчанию 0.
+	MaskBBoxMargin float32 `json:"mask_bbox_margin,omitempty"`
+
+	// MaxMasksPerTile ограничивает число кандидатов, растеризуемых на одном
+	// тайле (кандидаты отсортированы по убыванию score). Нужен прежде всего
+	// в режиме "semantic", где каждый кандидат читает маску по всему тайлу.
+	// 0 = без ограничения.
+	MaxMasksPerTile int `json:"max_masks_per_tile,omitempty"`
 }
+
+// IsSemanticModel reports that the ONNX graph itself is a dense semantic
+// segmenter. This is different from the legacy mask_mode="semantic", which
+// merely read YOLO instance prototypes outside their bbox and cannot turn an
+// instance-trained YOLO model into a true semantic model.
+func (m ModelSpec) IsSemanticModel() bool { return m.ModelKind == "semantic" }
+
+// SemanticMask reports that a YOLO instance mask should not be clipped by bbox.
+// Kept for backward compatibility with existing YOLO configs.
+func (m ModelSpec) SemanticMask() bool { return m.MaskMode == "semantic" }
 
 func FinalizeSpec(m ModelSpec) ModelSpec {
 	if m.ONNXFile == "" && m.Name != "" {
@@ -150,6 +277,14 @@ func FinalizeSpec(m ModelSpec) ModelSpec {
 	}
 	if m.Preprocess == "" {
 		m.Preprocess = "ortophoto"
+	}
+	switch strings.ToLower(strings.TrimSpace(m.ModelKind)) {
+	case "", "yolo", "yolo_seg", "yolo-seg", "instance":
+		m.ModelKind = "yolo_seg"
+	case "semantic", "dense", "semantic_seg":
+		m.ModelKind = "semantic"
+	default:
+		m.ModelKind = "yolo_seg"
 	}
 	if m.Tile <= 0 {
 		m.Tile = 1536
@@ -197,7 +332,22 @@ func FinalizeSpec(m ModelSpec) ModelSpec {
 		m.InputName = "images"
 	}
 	if len(m.OutputNames) == 0 {
-		m.OutputNames = []string{"output0", "output1"}
+		if m.IsSemanticModel() {
+			m.OutputNames = []string{"output"}
+		} else {
+			m.OutputNames = []string{"output0", "output1"}
+		}
+	}
+	if m.SemanticThresholdJSON != nil {
+		m.SemanticThreshold = *m.SemanticThresholdJSON
+		if m.SemanticThreshold < 0 {
+			m.SemanticThreshold = 0
+		}
+		if m.SemanticThreshold > 1 {
+			m.SemanticThreshold = 1
+		}
+	} else {
+		m.SemanticThreshold = 0.5
 	}
 	if m.YoloMaskDim <= 0 {
 		m.YoloMaskDim = 32
@@ -273,6 +423,33 @@ func FinalizeSpec(m ModelSpec) ModelSpec {
 		}
 	} else if m.RejectRepeatCount == 0 {
 		m.RejectRepeatCount = 6
+	}
+	if m.RejectBoxTileRatio < 0 {
+		m.RejectBoxTileRatio = 0
+	}
+	if m.RejectEdgeOversize < 0 {
+		m.RejectEdgeOversize = 0
+	}
+	if m.RejectEdgeOversize > 0 && m.RejectEdgePinPx <= 0 {
+		m.RejectEdgePinPx = 24
+	}
+	switch strings.ToLower(strings.TrimSpace(m.MaskMode)) {
+	case "", "instance", "bbox":
+		m.MaskMode = "instance"
+	case "semantic", "full", "carpet":
+		m.MaskMode = "semantic"
+	default:
+		// Неизвестное значение не должно молча менять поведение.
+		m.MaskMode = "instance"
+	}
+	if m.MaskBBoxMargin < 0 {
+		m.MaskBBoxMargin = 0
+	}
+	if m.MaskBBoxMargin > 4 {
+		m.MaskBBoxMargin = 4
+	}
+	if m.MaxMasksPerTile < 0 {
+		m.MaxMasksPerTile = 0
 	}
 	return m
 }

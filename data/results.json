@@ -1,1 +1,46 @@
-{"2c441013-1bc4-4eaa-8b09-b20e26bbed8b":{"cloud":50,"end":"2022-08-15","model":"hogweed","poligon":"kray","start":"2022-07-15","time":"2026-06-02 10:05"},"bdd1cd66-d0e5-4ab6-999b-e4b90b0b344b":{"cloud":50,"end":"2023-08-15","model":"hogweed","poligon":"kray","start":"2023-07-15","time":"2026-06-03 03:40"},"c1263632-052e-44f6-bd23-a931eb811749":{"cloud":50,"end":"2024-08-15","model":"hogweed","poligon":"kray","start":"2024-07-15","time":"2026-06-05 23:57"},"ddf49021-029d-4229-a400-7651d6b7601f":{"cloud":50,"end":"2021-08-15","model":"hogweed","poligon":"kray","start":"2021-07-15","time":"2026-06-01 16:25"},"eafea2e4-c840-4f4b-a1ea-fa8cc13b5a6f":{"cloud":30,"end":"2025-08-15","model":"hogweed","poligon":"kray","start":"2025-07-15","time":"2026-05-25 18:53"}}
+{
+  "01758f1c-b647-41a2-8794-d7e988993268": {
+    "model": "landfill",
+    "preprocess": "sentinel",
+    "poligon": "cherdinsky",
+    "cloud": 15,
+    "start": "2026-06-01",
+    "end": "2026-08-12",
+    "time": "2026-08-12 15:02"
+  },
+  "32388ad7-7f4d-4eb8-a777-b31374687477": {
+    "model": "buildings",
+    "preprocess": "ortophoto",
+    "poligon": "kray",
+    "start": "2026",
+    "end": "2026",
+    "time": "2026-09-04 12:20"
+  },
+  "3ac2d3d8-d20b-44a7-a6e4-9eb44382aece": {
+    "model": "hogweed",
+    "preprocess": "sentinel",
+    "poligon": "krasnokamsky",
+    "cloud": 50,
+    "start": "2026-07-15",
+    "end": "2026-08-13",
+    "time": "2026-08-13 10:49"
+  },
+  "86748abb-0f84-4122-903f-c45fc9d25654": {
+    "model": "hogweed",
+    "preprocess": "sentinel",
+    "poligon": "kray",
+    "cloud": 50,
+    "start": "2026-07-15",
+    "end": "2026-08-11",
+    "time": "2026-08-11 20:56"
+  },
+  "deffec1f-d895-4588-bdea-ecfcc1e54ccf": {
+    "model": "hogweed",
+    "preprocess": "sentinel",
+    "poligon": "kray",
+    "cloud": 50,
+    "start": "2026-07-15",
+    "end": "2026-08-15",
+    "time": "2026-08-18 05:08"
+  }
+}

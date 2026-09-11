@@ -212,6 +212,36 @@ func (s *ORTSession) Close() error {
 }
 
 func (s *ORTSession) Predict(input []float32, batch, channels, height, width, outChannels int) ([]float32, error) {
+	return s.predictDenseOnce(input, batch, channels, height, width, outChannels)
+}
+
+// PredictSemantic runs a dense [B,C,H,W] segmentation model and performs the
+// same one-shot CUDA allocation recovery as the YOLO path. The exported ASIM
+// semantic models intentionally preserve input H/W at the output.
+func (s *ORTSession) PredictSemantic(input []float32, channels, height, width, outChannels int) ([]float32, error) {
+	out, err := s.predictDenseOnce(input, 1, channels, height, width, outChannels)
+	if err == nil || !isCUDAAllocationError(err) {
+		return out, err
+	}
+	log.Printf("onnxruntime CUDA allocation failure during semantic inference; retrying current patch once after session reset: device_id=%d error=%v", s.deviceID, err)
+	if resetErr := s.resetAfterCUDAAllocationFailure(); resetErr != nil {
+		return nil, fmt.Errorf("CUDA allocation failure (%v); semantic session reset failed: %w", err, resetErr)
+	}
+	out, retryErr := s.predictDenseOnce(input, 1, channels, height, width, outChannels)
+	if retryErr != nil {
+		return nil, fmt.Errorf("CUDA semantic inference failed after one session-reset retry: %w", retryErr)
+	}
+	log.Printf("onnxruntime CUDA semantic inference recovered after session reset: device_id=%d", s.deviceID)
+	return out, nil
+}
+
+func (s *ORTSession) predictDenseOnce(input []float32, batch, channels, height, width, outChannels int) ([]float32, error) {
+	if len(s.outputNames) != 1 {
+		return nil, fmt.Errorf("dense semantic ONNX session requires exactly one output, got %d", len(s.outputNames))
+	}
+	if batch <= 0 || channels <= 0 || height <= 0 || width <= 0 || outChannels <= 0 {
+		return nil, fmt.Errorf("invalid dense tensor shape: batch=%d channels=%d height=%d width=%d outChannels=%d", batch, channels, height, width, outChannels)
+	}
 	inShape := ort.NewShape(int64(batch), int64(channels), int64(height), int64(width))
 	inTensor, err := ort.NewTensor[float32](inShape, input)
 	if err != nil {

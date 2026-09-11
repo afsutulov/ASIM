@@ -207,6 +207,10 @@ func validateSharedONNXSettings(models map[string]ModelSpec) error {
 				cur.MaskThreshold != base.MaskThreshold || cur.YoloMaskDim != base.YoloMaskDim ||
 				cur.YoloProtoStride != base.YoloProtoStride || cur.InputName != base.InputName ||
 				string(curOutputs) != string(baseOutputs) || string(curThresholds) != string(baseThresholds) ||
+				cur.RejectBoxTileRatio != base.RejectBoxTileRatio ||
+				cur.RejectEdgeOversize != base.RejectEdgeOversize || cur.RejectEdgePinPx != base.RejectEdgePinPx ||
+				cur.MaskMode != base.MaskMode || cur.MaskBBoxMargin != base.MaskBBoxMargin ||
+				cur.MaxMasksPerTile != base.MaxMasksPerTile ||
 				cur.SkipEmptyTiles != base.SkipEmptyTiles || cur.MinContentPixels != base.MinContentPixels ||
 				string(curMergeRules) != string(baseMergeRules) {
 				return fmt.Errorf("exclusive models %q and %q using %q have different inference settings", base.Name, cur.Name, onnx)
