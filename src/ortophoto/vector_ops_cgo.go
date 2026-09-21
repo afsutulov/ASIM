@@ -31,6 +31,7 @@ import "C"
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -508,6 +509,8 @@ func AppendShapefileToAccumulatorFilteredByGroup(srcShp string, outShp string, s
 	defer C.OSRDestroySpatialReference(outputSRS)
 
 	accepted := 0
+	droppedTransform := 0
+	droppedArea := 0
 	C.OGR_L_ResetReading(srcLayer)
 	for {
 		feat := C.OGR_L_GetNextFeature(srcLayer)
@@ -525,11 +528,13 @@ func AppendShapefileToAccumulatorFilteredByGroup(srcShp string, outShp string, s
 			if metricGeom != nil {
 				DestroyGeometry(metricGeom)
 			}
+			droppedTransform++
 			C.OGR_F_Destroy(feat)
 			continue
 		}
 
 		if minAreaM2 > 0 && float64(C.OGR_G_Area(metricGeom)) < minAreaM2 {
+			droppedArea++
 			DestroyGeometry(metricGeom)
 			C.OGR_F_Destroy(feat)
 			continue
@@ -551,6 +556,7 @@ func AppendShapefileToAccumulatorFilteredByGroup(srcShp string, outShp string, s
 				if wg != nil {
 					DestroyGeometry(wg)
 				}
+				droppedTransform++
 				C.OGR_F_Destroy(feat)
 				continue
 			}
@@ -578,6 +584,11 @@ func AppendShapefileToAccumulatorFilteredByGroup(srcShp string, outShp string, s
 		C.OGR_F_Destroy(feat)
 	}
 	C.GDALFlushCache(dstDS)
+	if droppedTransform > 0 || droppedArea > 0 {
+		// Раньше такие отбрасывания были молчаливыми, из-за чего пустой
+		// результат было невозможно отличить от «модель ничего не нашла».
+		log.Printf("ortophoto accumulator: group=%s accepted=%d dropped_by_transform=%d dropped_by_min_area=%d", group, accepted, droppedTransform, droppedArea)
+	}
 	return accepted, nil
 }
 

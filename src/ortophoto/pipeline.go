@@ -480,7 +480,7 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 			continue
 		}
 
-		sourceGroup, sourceCRSLabel, err := ClassifySourceCRS(info.Proj)
+		crsInfo, err := DetectSourceCRS(info.Proj)
 		if err != nil {
 			log.Printf("ortophoto CRS classify failed: file=%s error=%v", tif, err)
 			imgStat.Skipped = true
@@ -489,9 +489,18 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 			coverage.add(info.Geo, info.W, info.H, info.Proj, false)
 			continue
 		}
-		log.Printf("ortophoto source CRS: file=%s group=%s detail=%s", filepath.Base(tif), sourceGroup, sourceCRSLabel)
+		sourceGroup := crsInfo.Group
+		// srcWKT — CRS снимка для ВСЕХ координатных операций. Для МСК-59,
+		// распознанной по параметрам проекции, это эталонный BOUNDCRS зоны
+		// (с ГОСТ-параметрами датум-сдвига), даже если в GeoTIFF записана
+		// «голая» PROJCS "unknown" без TOWGS84.
+		srcWKT := crsInfo.WKT
+		log.Printf("ortophoto source CRS: file=%s group=%s detail=%s", filepath.Base(tif), sourceGroup, crsInfo.Detail)
+		if sourceGroup == SourceCRSMSK59 && crsInfo.MSKZone > 0 && crsInfo.MSKZone != targetZone {
+			log.Printf("ortophoto source CRS: file=%s MSK-59 zone %d differs from target zone %d, polygons will be converted zone->zone", filepath.Base(tif), crsInfo.MSKZone, targetZone)
+		}
 
-		intersects, err := RasterIntersectsAllowedWGS84(info.Geo, info.W, info.H, info.Proj, allowedGeom)
+		intersects, err := RasterIntersectsAllowedWGS84(info.Geo, info.W, info.H, srcWKT, allowedGeom)
 		if err != nil {
 			log.Printf("ortophoto spatial prefilter failed, image will be processed: file=%s error=%v", tif, err)
 			intersects = true
@@ -501,7 +510,7 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 			imgStat.SkipReason = "outside search polygon"
 			imgStat.Duration = time.Since(imgStart)
 			stats.Images = append(stats.Images, imgStat)
-			coverage.add(info.Geo, info.W, info.H, info.Proj, false)
+			coverage.add(info.Geo, info.W, info.H, srcWKT, false)
 			log.Printf("ortophoto image skipped by spatial prefilter: file=%s path=%s", filepath.Base(tif), tif)
 			continue
 		}
@@ -519,11 +528,11 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 			imgStat.Skipped = true
 			imgStat.SkipReason = err.Error()
 			stats.Images = append(stats.Images, imgStat)
-			coverage.add(info.Geo, info.W, info.H, info.Proj, false)
+			coverage.add(info.Geo, info.W, info.H, srcWKT, false)
 			continue
 		}
 		// Лист дошёл до модели — его контур попадает в покрытие.
-		coverage.add(img.Geo, img.W, img.H, img.Proj, true)
+		coverage.add(img.Geo, img.W, img.H, srcWKT, true)
 
 		mask, runs, dbg, err := runModelOnImage(img, sessions, cfg.Spec)
 		stats.ModelRuns += runs
@@ -588,12 +597,13 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 
 		_ = os.Remove(maskTif)
 		clippedShp := filepath.Join(workDir, safeName(strings.TrimSuffix(filepath.Base(tif), filepath.Ext(tif)))+"_clip_tmp.shp")
-		// Передаём img.Proj — полный WKT проекции снимка (BOUNDCRS с датум-сдвигом
-		// Pulkovo1942->WGS84) напрямую, а не полагаемся на СК, перечитанную из
+		// Передаём srcWKT — полный WKT проекции снимка (BOUNDCRS с датум-сдвигом
+		// Pulkovo1942->WGS84; для МСК-59 — эталонный BOUNDCRS зоны, см.
+		// DetectSourceCRS) напрямую, а не полагаемся на СК, перечитанную из
 		// .prj файла fileShp: при записи в ESRI Shapefile GDAL теряет параметры
 		// датум-трансформации, из-за чего сверка с шаблоном полигона поиска
 		// (хранится в WGS84) ломается и результат становится пустым.
-		if err := ClipShapefileToGeometryWithSRSWKT(fileShp, clippedShp, allowedGeom, img.Proj); err != nil {
+		if err := ClipShapefileToGeometryWithSRSWKT(fileShp, clippedShp, allowedGeom, srcWKT); err != nil {
 			return "", stats, err
 		}
 		nativeCount, err := countVectorFeatures(clippedShp)
@@ -607,7 +617,7 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 				dstAccumulator = mskResultShp
 			}
 			polyCount, err = AppendShapefileToAccumulatorFilteredByGroup(
-				clippedShp, dstAccumulator, img.Proj, targetZone, sourceGroup, cfg.Spec.MinAreaM2, cfg.Spec.Simplify,
+				clippedShp, dstAccumulator, srcWKT, targetZone, sourceGroup, cfg.Spec.MinAreaM2, cfg.Spec.Simplify,
 			)
 			if err != nil {
 				return "", stats, err
@@ -687,6 +697,15 @@ func RunProcess(cfg ProcessConfig) (string, ProcessStats, error) {
 		mskGeoJSON := filepath.Join(workDir, fmt.Sprintf("%s_MSK59-%d.geojson", baseName, targetZone))
 		if err := ExportShapefileToGeoJSON(mskResultShp, mskGeoJSON); err != nil {
 			return "", stats, err
+		}
+		// GeoJSON-драйвер GDAL не пишет "crs" для СК без кода EPSG — без этого
+		// шага файл МСК-59 открывается как WGS84 и полигоны «пропадают».
+		mskWKT, err := MSK59WKT1(targetZone)
+		if err != nil {
+			return "", stats, err
+		}
+		if err := InjectGeoJSONCRS(mskGeoJSON, mskWKT); err != nil {
+			return "", stats, fmt.Errorf("write CRS into %s: %w", filepath.Base(mskGeoJSON), err)
 		}
 		generatedOutputs = append(generatedOutputs, filepath.Base(mskGeoJSON))
 		resultOutputPaths = append(resultOutputPaths, mskGeoJSON)
